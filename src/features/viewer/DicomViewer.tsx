@@ -117,7 +117,8 @@ export default function DicomViewer({
         setLoading(true);
         setImageLoaded(false);
         const currentFile = seriesFileList[safeIndex];
-        const imageUrl = `http://localhost:8000/dicom/${studyId}/${encodeURIComponent(currentFile)}`;
+        // const imageUrl = `http://localhost:8000/dicom/${studyId}/${encodeURIComponent(currentFile)}`;
+        const imageUrl = `wadouri:/dicom/${studyId}/${encodeURIComponent(currentFile)}`;
         const image = await window.cornerstone.loadImage(imageUrl);
         window.cornerstone.displayImage(containerRef.current, image);
         setImageLoaded(true);
