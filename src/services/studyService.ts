@@ -1,5 +1,5 @@
-const BASE = "http://localhost:8000/api/v1";
-
+// const BASE = "http://localhost:8000/api/v1";
+const BASE = "/api/v1";
 export interface StudyPayload {
   patient_name: string;
   patient_id: string;
