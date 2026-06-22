@@ -17,7 +17,6 @@ const formatSize = (bytes: number) => {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 };
 
-// Stable identity key for deduplication — name + size is good enough for DICOM
 const fileKey = (f: File) => `${f.name}-${f.size}`;
 
 export default function UploadPage() {
@@ -31,11 +30,6 @@ export default function UploadPage() {
   const [rawFiles, setRawFiles] = useState<File[]>([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [uploadStage, setUploadStage] = useState<string>("");
-
-  // ── Synchronous submit guard ────────────────────────────────────────────────
-  // useRef is synchronous — both rapid clicks read the SAME ref value before
-  // any re-render, so only the first call ever proceeds. useState is async and
-  // cannot reliably block a second call that arrives in the same event loop tick.
   const isSubmittingRef = useRef(false);
 
   useEffect(() => {
@@ -46,17 +40,11 @@ export default function UploadPage() {
 
   // ── File handling ───────────────────────────────────────────────────────────
   const addFiles = (newFiles: File[]) => {
-    // Deduplicate against what's already queued — dropzones often fire both
-    // onDrop and onChange for the same drop, which previously caused each file
-    // to appear twice in rawFiles and get uploaded twice.
     setRawFiles((prev) => {
       const existingKeys = new Set(prev.map(fileKey));
       const fresh = newFiles.filter((f) => !existingKeys.has(fileKey(f)));
       if (fresh.length === 0) return prev;
 
-      // Kick off the fake progress animation for each genuinely new file.
-      // We do this inside setRawFiles so `prev.length` is always accurate
-      // and we never read stale state from the render closure.
       const startIdx = prev.length;
       const mapped: UploadedFile[] = fresh.map((f) => ({
         name: f.name,
@@ -113,7 +101,6 @@ export default function UploadPage() {
   };
 
   const handleSubmit = async () => {
-    // Synchronous ref check — blocks re-entrancy before any state update
     if (isSubmittingRef.current) return;
     if (!validate()) return;
 
@@ -136,7 +123,7 @@ export default function UploadPage() {
         is_urgent: form.urgent,
       });
 
-      // 2. Upload all DICOM files in parallel — one round-trip instead of N
+      // 2. Upload all files in parallel
       if (rawFiles.length > 0) {
         setUploadStage(
           `Uploading ${rawFiles.length} file${rawFiles.length > 1 ? "s" : ""}…`,
@@ -144,16 +131,16 @@ export default function UploadPage() {
         await Promise.all(rawFiles.map((file) => uploadDicom(study.id, file)));
       }
 
-      // 3. Refresh worklist so the new study is visible immediately
-      setUploadStage("Finalizing…");
-      await refresh();
-
+      // 3. Show success screen immediately — unmounts the form so there is
+      //    zero window for a second submit. refresh() is fire-and-forget so
+      //    the worklist is ready by the time the user clicks "View in Worklist".
       setSubmitted(true);
+      void refresh();
+
     } catch (err) {
       console.error("Upload failed:", err);
       setUploadStage("");
     } finally {
-      // Always release both the ref and the state lock
       isSubmittingRef.current = false;
       setIsSubmitting(false);
     }
@@ -168,7 +155,7 @@ export default function UploadPage() {
     setUploadStage("");
   };
 
-  // ── Render: success ─────────────────────────────────────────────────────────
+  // ── Success screen ──────────────────────────────────────────────────────────
   if (submitted) {
     return (
       <UploadSuccessModal
@@ -181,7 +168,7 @@ export default function UploadPage() {
 
   const pad = isMobile ? "16px" : "32px";
 
-  // ── Render: upload form ─────────────────────────────────────────────────────
+  // ── Upload form ─────────────────────────────────────────────────────────────
   return (
     <div
       style={{
