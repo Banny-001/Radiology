@@ -8,7 +8,7 @@ import ConnectedDevicesCard from "./Connecteddevicescard";
 import DicomDropZone from "./Dicomdropzone";
 import PatientInfoForm from "./Patientinfoform";
 import UploadSuccessModal from "./Uploadsuccessmodal";
-import { createStudy, uploadDicom } from "../../../services/studyService";
+import { createStudy, uploadDicomBatch } from "../../../services/studyService";
 import { useStudies } from "../../../context/StudyContext";
 
 const formatSize = (bytes: number) => {
@@ -123,17 +123,19 @@ export default function UploadPage() {
         is_urgent: form.urgent,
       });
 
-      // 2. Upload all files in parallel
+      // 2. Bundle all DICOM files into one ZIP and send a single request.
+      //    Previously: N parallel requests (one per file) → 96 network calls.
+      //    Now: 1 request regardless of file count.
       if (rawFiles.length > 0) {
         setUploadStage(
-          `Uploading ${rawFiles.length} file${rawFiles.length > 1 ? "s" : ""}…`,
+          rawFiles.length === 1
+            ? "Uploading file…"
+            : `Bundling ${rawFiles.length} files & uploading…`,
         );
-        await Promise.all(rawFiles.map((file) => uploadDicom(study.id, file)));
+        await uploadDicomBatch(study.id, rawFiles);
       }
 
-      // 3. Show success screen immediately — unmounts the form so there is
-      //    zero window for a second submit. refresh() is fire-and-forget so
-      //    the worklist is ready by the time the user clicks "View in Worklist".
+      // 3. Show success immediately — unmounts form so no second submit possible
       setSubmitted(true);
       void refresh();
 
@@ -168,7 +170,6 @@ export default function UploadPage() {
 
   const pad = isMobile ? "16px" : "32px";
 
-  // ── Upload form ─────────────────────────────────────────────────────────────
   return (
     <div
       style={{

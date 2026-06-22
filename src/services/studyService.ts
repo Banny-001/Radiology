@@ -1,6 +1,8 @@
+import { zip } from "fflate";
+
 const BASE = "/api/v1";
 
-// ─── Types ──────────────────────────────────────────────────────────────────
+// ─── Types ───────────────────────────────────────────────────────────────────
 
 export interface StudyPayload {
   patient_name: string;
@@ -48,13 +50,10 @@ export interface DicomFileListResponse {
   files: string[];
 }
 
-// ─── Typed API error ─────────────────────────────────────────────────────────
-// Carries the HTTP status so callers can branch on 401/403/404 etc. without
-// string-matching error messages.
+// ─── Typed API error ──────────────────────────────────────────────────────────
 
 export class ApiError extends Error {
   readonly status: number;
-
   constructor(status: number, message: string) {
     super(message);
     this.name = "ApiError";
@@ -62,44 +61,33 @@ export class ApiError extends Error {
   }
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-// Thin fetch wrapper.
-// - Deserialises JSON on success.
-// - Throws ApiError with status + body on HTTP errors.
-// - Retries server errors (5xx) with exponential back-off; never retries 4xx.
 async function apiFetch<T>(
   url: string,
   options?: RequestInit,
   retries = 1,
 ): Promise<T> {
   let lastErr: unknown;
-
   for (let attempt = 0; attempt <= retries; attempt++) {
-    if (attempt > 0) await sleep(300 * 2 ** (attempt - 1)); // 300 ms, 600 ms …
+    if (attempt > 0) await sleep(300 * 2 ** (attempt - 1));
     try {
       const res = await fetch(url, options);
       if (res.ok) return res.json() as Promise<T>;
-
       const body = await res.text();
-      // Client errors are deterministic — never worth retrying.
       if (res.status < 500) throw new ApiError(res.status, body);
       lastErr = new ApiError(res.status, body);
     } catch (err) {
-      // Re-throw immediately for 4xx (ApiError thrown above) or abort errors.
       if (err instanceof ApiError) throw err;
       lastErr = err;
     }
   }
-
   throw lastErr;
 }
 
-// ─── TTL cache ───────────────────────────────────────────────────────────────
-// Simple in-memory store keyed by string. Entries expire after `ttlMs`
-// milliseconds and are evicted lazily on next read.
+// ─── TTL cache ────────────────────────────────────────────────────────────────
 
 interface CacheEntry<T> {
   value: T;
@@ -127,8 +115,6 @@ class TtlCache<T> {
     this.store.delete(key);
   }
 
-  // Remove all entries whose key starts with `prefix`.
-  // Used to bust the study-list cache after any mutation.
   invalidatePrefix(prefix: string): void {
     for (const key of this.store.keys()) {
       if (key.startsWith(prefix)) this.store.delete(key);
@@ -140,37 +126,63 @@ class TtlCache<T> {
   }
 }
 
-// ─── In-flight deduplication ─────────────────────────────────────────────────
-// If two callers request the same resource simultaneously only one network
-// request goes out; both await the same Promise. The entry is removed once
-// the request settles (success or error) so a fresh fetch can be made later.
-// This is the biggest win for DicomViewer, which currently fires getDicomFileList
-// on every mount and every series switch.
+// ─── In-flight deduplication ──────────────────────────────────────────────────
 
 const inFlight = new Map<string, Promise<unknown>>();
 
 function dedupe<T>(key: string, fn: () => Promise<T>): Promise<T> {
   const existing = inFlight.get(key);
   if (existing) return existing as Promise<T>;
-
   const p = fn().finally(() => inFlight.delete(key));
   inFlight.set(key, p);
   return p;
 }
 
-// ─── Cache instances + TTLs ───────────────────────────────────────────────────
+// ─── Cache instances ──────────────────────────────────────────────────────────
 
 const studyListCache = new TtlCache<StudyListOut>();
 const studyCache = new TtlCache<StudyOut>();
 const fileListCache = new TtlCache<string[]>();
 
 const TTL = {
-  studyList: 30_000, // 30 s  — worklist is polled-ish, keep fresh
-  study: 60_000, // 1 min — single study metadata
-  fileList: 5 * 60_000, // 5 min — file list is immutable after upload
+  studyList: 30_000,
+  study: 60_000,
+  fileList: 5 * 60_000,
 } as const;
 
-// ─── Study mutations ─────────────────────────────────────────────────────────
+// ─── ZIP helper ───────────────────────────────────────────────────────────────
+// Bundles multiple File objects into a single ZIP Blob using fflate's
+// async `zip()` so the main thread is never blocked.
+
+function bundleAsZip(files: File[]): Promise<Blob> {
+  return new Promise(async (resolve, reject) => {
+    try {
+      // Read all files into Uint8Arrays in parallel
+      const entries = await Promise.all(
+        files.map(async (f) => {
+          const buf = await f.arrayBuffer();
+          return [f.name, new Uint8Array(buf)] as [string, Uint8Array];
+        }),
+      );
+
+      // Build the fflate input map — DICOM files are already compressed
+      // so store them without re-compression (level: 0) for max speed.
+      const input: Record<string, [Uint8Array, { level: 0 }]> = {};
+      for (const [name, data] of entries) {
+        input[name] = [data, { level: 0 }];
+      }
+
+      zip(input, (err, data) => {
+        if (err) return reject(err);
+        resolve(new Blob([data], { type: "application/zip" }));
+      });
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
+// ─── Study mutations ──────────────────────────────────────────────────────────
 
 export async function createStudy(payload: StudyPayload): Promise<StudyOut> {
   const study = await apiFetch<StudyOut>(`${BASE}/studies/`, {
@@ -178,24 +190,48 @@ export async function createStudy(payload: StudyPayload): Promise<StudyOut> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-  // New study → bust list cache so worklist reflects it immediately.
   studyListCache.invalidatePrefix("studies:");
-  // Warm single-study cache.
   studyCache.set(`study:${study.id}`, study, TTL.study);
   return study;
 }
 
-export async function uploadDicom(
-  studyId: string,
-  file: File,
-): Promise<StudyOut> {
+// ── Single-file upload (kept for backwards compat) ────────────────────────────
+export async function uploadDicom(studyId: string, file: File): Promise<StudyOut> {
   const form = new FormData();
   form.append("file", file);
   const study = await apiFetch<StudyOut>(
     `${BASE}/studies/${studyId}/upload-dicom`,
     { method: "POST", body: form },
   );
-  // File list changed — evict stale cache entries.
+  studyCache.set(`study:${studyId}`, study, TTL.study);
+  fileListCache.delete(`files:${studyId}`);
+  studyListCache.invalidatePrefix("studies:");
+  return study;
+}
+
+// ── Batch upload — ONE request regardless of file count ───────────────────────
+// All files are zipped client-side and sent as a single multipart request.
+// The backend's existing ZIP extraction handler unpacks them server-side.
+// Reduces N upload-dicom requests to exactly 1.
+export async function uploadDicomBatch(
+  studyId: string,
+  files: File[],
+): Promise<StudyOut> {
+  if (files.length === 0) return getStudy(studyId);
+
+  // Single file — skip ZIP overhead, send directly
+  if (files.length === 1) return uploadDicom(studyId, files[0]);
+
+  const zipBlob = await bundleAsZip(files);
+  const form = new FormData();
+  form.append("file", new File([zipBlob], "batch.zip", { type: "application/zip" }));
+
+  const study = await apiFetch<StudyOut>(
+    `${BASE}/studies/${studyId}/upload-dicom`,
+    { method: "POST", body: form },
+    2, // retry up to 2x — single large upload is worth retrying
+  );
+
   studyCache.set(`study:${studyId}`, study, TTL.study);
   fileListCache.delete(`files:${studyId}`);
   studyListCache.invalidatePrefix("studies:");
@@ -246,7 +282,6 @@ export function listStudies(params?: {
   return dedupe(cacheKey, async () => {
     const data = await apiFetch<StudyListOut>(`${BASE}/studies/?${q}`);
     studyListCache.set(cacheKey, data, TTL.studyList);
-    // Warm individual study cache from the list payload — zero extra requests.
     for (const item of data.items) {
       studyCache.set(`study:${item.id}`, item, TTL.study);
     }
@@ -266,12 +301,6 @@ export function getStudy(studyId: string): Promise<StudyOut> {
   });
 }
 
-// ─── DICOM file list ──────────────────────────────────────────────────────────
-// Most aggressively optimised endpoint:
-//   1. Long TTL (files don't change after upload).
-//   2. In-flight deduplication (DicomViewer re-mounts on every series switch).
-//   3. Retry on transient server errors.
-
 export function getDicomFileList(studyId: string): Promise<string[]> {
   const cacheKey = `files:${studyId}`;
   const cached = fileListCache.get(cacheKey);
@@ -281,7 +310,7 @@ export function getDicomFileList(studyId: string): Promise<string[]> {
     const data = await apiFetch<DicomFileListResponse>(
       `${BASE}/studies/${studyId}/files`,
       undefined,
-      2, // up to 2 retries for this critical path
+      2,
     );
     const files = data.files ?? [];
     fileListCache.set(cacheKey, files, TTL.fileList);
@@ -290,15 +319,12 @@ export function getDicomFileList(studyId: string): Promise<string[]> {
 }
 
 // ─── Prefetch helpers ─────────────────────────────────────────────────────────
-// Call these on hover/intent to warm the cache before navigation.
-// Both are no-ops if data is already cached.
 
 export const prefetchStudy = (studyId: string) => void getStudy(studyId);
 export const prefetchDicomFileList = (studyId: string) =>
   void getDicomFileList(studyId);
 
 // ─── Cache management ─────────────────────────────────────────────────────────
-// Expose for use in dev tools or a "force refresh" UI button.
 
 export function invalidateStudyCache(studyId?: string): void {
   if (studyId) {
