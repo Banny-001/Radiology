@@ -19,7 +19,7 @@ interface DicomViewerProps {
   flipH: boolean;
   flipV: boolean;
   isInverted: boolean;
-  imageIndex?: number; // 0-based; controlled by parent
+  imageIndex?: number;
   offsetX?: number;
   offsetY?: number;
   activeSeries?: number;
@@ -47,16 +47,19 @@ export default function DicomViewer({
   const [fileList, setFileList] = useState<string[]>([]);
   const [imageLoaded, setImageLoaded] = useState(false);
 
+  // Tracks whether cornerstone.enable() has successfully run on this element.
+  // Using a ref (not state) so it doesn't trigger extra renders.
+  const csEnabledRef = useRef(false);
+
+  // ── Series partitioning ───────────────────────────────────────────────────
   // Partition the flat file list into `seriesCount` contiguous chunks and
   // take the slice belonging to `activeSeries`. The backend gives us a single
-  // list per study, so this is how we map the SERIES_MAP entries (AP/PA/
-  // Lateral/Oblique for X-ray, Axial/Coronal/Sagittal for CT, etc.) onto
-  // real files until the backend grows a proper series concept.
+  // list per study, so this maps SERIES_MAP entries onto real files until
+  // the backend grows a proper series concept.
   const seriesFileList = (() => {
     if (fileList.length === 0 || seriesCount <= 1) return fileList;
     const chunkSize = Math.max(1, Math.floor(fileList.length / seriesCount));
     const start = activeSeries * chunkSize;
-    // Last chunk grabs any remainder so no files are dropped.
     const end =
       activeSeries === seriesCount - 1 ? fileList.length : start + chunkSize;
     return fileList.slice(start, end);
@@ -68,32 +71,32 @@ export default function DicomViewer({
       ? Math.max(0, Math.min(seriesFileList.length - 1, imageIndex))
       : 0;
 
-  // ── Load DICOM file list from backend ────────────────────────────────
+  // ── Fetch file list ───────────────────────────────────────────────────────
   useEffect(() => {
-    const fetchFileList = async () => {
-      try {
-        const files = await getDicomFileList(studyId);
+    getDicomFileList(studyId)
+      .then((files) => {
         setFileList(files);
         if (files.length === 0) {
           setError("No DICOM files found in this study");
         }
-      } catch (err) {
+      })
+      .catch((err) => {
         console.error("[DicomViewer] Failed to fetch file list:", err);
         setError(`Failed to load file list:\n${(err as Error).message}`);
-      }
-    };
-    fetchFileList();
+      });
   }, [studyId]);
 
-  // Report per-series count whenever the series chunk changes, so the parent's
-  // scroll/cine bounds match what's actually being shown.
+  // ── Report per-series file count to parent ────────────────────────────────
   useEffect(() => {
     onFileCountChange?.(seriesFileList.length);
   }, [seriesFileList.length, activeSeries]);
 
-  // ── Initialize Cornerstone on mount ─────────────────────────────────
+  // ── Initialize Cornerstone ONCE on mount ──────────────────────────────────
+  // Disables on unmount so Cornerstone's internal element registry stays clean.
   useEffect(() => {
-    if (!containerRef.current) return;
+    const el = containerRef.current;
+    if (!el) return;
+
     if (!window.cornerstone) {
       setError(
         "Cornerstone not initialized.\n\n" +
@@ -101,26 +104,60 @@ export default function DicomViewer({
       );
       return;
     }
+
     try {
-      window.cornerstone.enable(containerRef.current);
+      window.cornerstone.enable(el);
+      csEnabledRef.current = true;
     } catch (err) {
       setError(`Cornerstone initialization failed:\n${(err as Error).message}`);
     }
+
+    return () => {
+      try {
+        window.cornerstone.disable(el);
+      } catch {
+        // ignore — element may already be gone
+      }
+      csEnabledRef.current = false;
+    };
   }, []);
 
-  // ── Load current DICOM image ───────────────────────────────────────
+  // ── Load current DICOM image ──────────────────────────────────────────────
   useEffect(() => {
-    if (!containerRef.current || !window.cornerstone || seriesFileList.length === 0) return;
+    if (seriesFileList.length === 0) return;
 
-    const loadDicomImage = async () => {
+    // Capture the DOM element synchronously — before any await — so we
+    // never operate on a stale ref value after an async gap.
+    const el = containerRef.current;
+    if (!el || !window.cornerstone) return;
+
+    // If cornerstone.enable() hasn't completed yet (both effects fire in the
+    // same React flush on first render), retry once after a short delay.
+    if (!csEnabledRef.current) {
+      const timer = setTimeout(() => {
+        if (!csEnabledRef.current || !containerRef.current) return;
+        loadImage(containerRef.current);
+      }, 50);
+      return () => clearTimeout(timer);
+    }
+
+    loadImage(el);
+
+    async function loadImage(element: HTMLDivElement) {
       try {
         setLoading(true);
         setImageLoaded(false);
+
         const currentFile = seriesFileList[safeIndex];
-        // const imageUrl = `http://localhost:8000/dicom/${studyId}/${encodeURIComponent(currentFile)}`;
         const imageUrl = `wadouri:/dicom/${studyId}/${encodeURIComponent(currentFile)}`;
         const image = await window.cornerstone.loadImage(imageUrl);
-        window.cornerstone.displayImage(containerRef.current, image);
+
+        // Guard: component may have unmounted or Cornerstone disabled
+        // during the async loadImage call — bail out rather than calling
+        // displayImage on a detached element, which causes "element not enabled".
+        if (!csEnabledRef.current) return;
+
+        window.cornerstone.displayImage(element, image);
         setImageLoaded(true);
         setError(null);
       } catch (err) {
@@ -129,12 +166,10 @@ export default function DicomViewer({
       } finally {
         setLoading(false);
       }
-    };
-
-    loadDicomImage();
+    }
   }, [safeIndex, seriesFileList, studyId]);
 
-  // ── Apply transformations (zoom, rotation, flip, invert, translation) ──
+  // ── Apply viewport transformations ───────────────────────────────────────
   useEffect(() => {
     if (!containerRef.current || !window.cornerstone || !imageLoaded) return;
     try {
@@ -152,6 +187,7 @@ export default function DicomViewer({
     }
   }, [zoom, rotation, flipH, flipV, isInverted, offsetX, offsetY, imageLoaded]);
 
+  // ── Error state ───────────────────────────────────────────────────────────
   if (error) {
     return (
       <div
@@ -179,6 +215,7 @@ export default function DicomViewer({
     );
   }
 
+  // ── Render ────────────────────────────────────────────────────────────────
   return (
     <div style={{ width: "100%", height: "100%", position: "relative" }}>
       <div
