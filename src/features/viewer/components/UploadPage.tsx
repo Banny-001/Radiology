@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { AlertTriangle } from "lucide-react";
 import PacsConnectionCard from "../Pacsconnectioncard";
@@ -11,14 +11,15 @@ import UploadSuccessModal from "./Uploadsuccessmodal";
 import { createStudy, uploadDicom } from "../../../services/studyService";
 import { useStudies } from "../../../context/StudyContext";
 
-// ─── Shared file-size helper ──────────────────────────────────────────────────
 const formatSize = (bytes: number) => {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 };
 
-// ─── UploadPage ───────────────────────────────────────────────────────────────
+// Stable identity key for deduplication — name + size is good enough for DICOM
+const fileKey = (f: File) => `${f.name}-${f.size}`;
+
 export default function UploadPage() {
   const navigate = useNavigate();
   const { refresh } = useStudies();
@@ -28,11 +29,14 @@ export default function UploadPage() {
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [submitted, setSubmitted] = useState(false);
   const [rawFiles, setRawFiles] = useState<File[]>([]);
-  // added: guards against double-submit (double-click / fast re-click) which
-  // was causing createStudy() to fire twice and the same files to be
-  // re-uploaded into a brand-new duplicate study each time
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [uploadStage, setUploadStage] = useState<string>("");
+
+  // ── Synchronous submit guard ────────────────────────────────────────────────
+  // useRef is synchronous — both rapid clicks read the SAME ref value before
+  // any re-render, so only the first call ever proceeds. useState is async and
+  // cannot reliably block a second call that arrives in the same event loop tick.
+  const isSubmittingRef = useRef(false);
 
   useEffect(() => {
     const handler = () => setIsMobile(window.innerWidth < 768);
@@ -42,38 +46,53 @@ export default function UploadPage() {
 
   // ── File handling ───────────────────────────────────────────────────────────
   const addFiles = (newFiles: File[]) => {
-    setRawFiles((prev) => [...prev, ...newFiles]); // ← add this line
-    const startIdx = files.length;
-    const mapped: UploadedFile[] = newFiles.map((f) => ({
-      name: f.name,
-      size: formatSize(f.size),
-      progress: 0,
-      done: false,
-    }));
-    setFiles((prev) => [...prev, ...mapped]);
+    // Deduplicate against what's already queued — dropzones often fire both
+    // onDrop and onChange for the same drop, which previously caused each file
+    // to appear twice in rawFiles and get uploaded twice.
+    setRawFiles((prev) => {
+      const existingKeys = new Set(prev.map(fileKey));
+      const fresh = newFiles.filter((f) => !existingKeys.has(fileKey(f)));
+      if (fresh.length === 0) return prev;
 
-    mapped.forEach((_, i) => {
-      const idx = startIdx + i;
-      let prog = 0;
-      const interval = setInterval(() => {
-        prog += Math.random() * 20 + 10;
-        if (prog >= 100) {
-          clearInterval(interval);
-          setFiles((prev) =>
-            prev.map((f, fi) =>
-              fi === idx ? { ...f, progress: 100, done: true } : f,
-            ),
-          );
-        } else {
-          setFiles((prev) =>
-            prev.map((f, fi) =>
-              fi === idx ? { ...f, progress: Math.round(prog) } : f,
-            ),
-          );
-        }
-      }, 300);
+      // Kick off the fake progress animation for each genuinely new file.
+      // We do this inside setRawFiles so `prev.length` is always accurate
+      // and we never read stale state from the render closure.
+      const startIdx = prev.length;
+      const mapped: UploadedFile[] = fresh.map((f) => ({
+        name: f.name,
+        size: formatSize(f.size),
+        progress: 0,
+        done: false,
+      }));
+
+      setFiles((prevFiles) => [...prevFiles, ...mapped]);
+
+      mapped.forEach((_, i) => {
+        const idx = startIdx + i;
+        let prog = 0;
+        const interval = setInterval(() => {
+          prog += Math.random() * 20 + 10;
+          if (prog >= 100) {
+            clearInterval(interval);
+            setFiles((pf) =>
+              pf.map((f, fi) =>
+                fi === idx ? { ...f, progress: 100, done: true } : f,
+              ),
+            );
+          } else {
+            setFiles((pf) =>
+              pf.map((f, fi) =>
+                fi === idx ? { ...f, progress: Math.round(prog) } : f,
+              ),
+            );
+          }
+        }, 300);
+      });
+
+      return [...prev, ...fresh];
     });
   };
+
   const removeFile = (idx: number) => {
     setFiles((prev) => prev.filter((_, i) => i !== idx));
     setRawFiles((prev) => prev.filter((_, i) => i !== idx));
@@ -94,15 +113,16 @@ export default function UploadPage() {
   };
 
   const handleSubmit = async () => {
-    // added: hard stop on re-entrancy — if a submit is already in flight,
-    // ignore this call instead of creating a second study
-    if (isSubmitting) return;
+    // Synchronous ref check — blocks re-entrancy before any state update
+    if (isSubmittingRef.current) return;
     if (!validate()) return;
 
-    setIsSubmitting(true); // added
+    isSubmittingRef.current = true;
+    setIsSubmitting(true);
+
     try {
       // 1. Create study record
-      setUploadStage("Creating study record..."); // added
+      setUploadStage("Creating study record…");
       const study = await createStudy({
         patient_name: form.patientName,
         patient_id: form.patientId,
@@ -116,25 +136,26 @@ export default function UploadPage() {
         is_urgent: form.urgent,
       });
 
-      // 2. Upload any .dcm files attached
-      for (let i = 0; i < rawFiles.length; i++) {
-        // added: real per-file "Uploading X of N" status, replacing the
-        // fake progress bar as the source of truth for upload state
-        setUploadStage(`Uploading ${i + 1} of ${rawFiles.length}...`);
-        await uploadDicom(study.id, rawFiles[i]);
+      // 2. Upload all DICOM files in parallel — one round-trip instead of N
+      if (rawFiles.length > 0) {
+        setUploadStage(
+          `Uploading ${rawFiles.length} file${rawFiles.length > 1 ? "s" : ""}…`,
+        );
+        await Promise.all(rawFiles.map((file) => uploadDicom(study.id, file)));
       }
 
-      // 3. Refresh the shared studies context so the worklist already
-      //    reflects this new study before the user navigates there
-      setUploadStage("Finalizing..."); // added
+      // 3. Refresh worklist so the new study is visible immediately
+      setUploadStage("Finalizing…");
       await refresh();
 
       setSubmitted(true);
     } catch (err) {
       console.error("Upload failed:", err);
-      setUploadStage(""); // added: clear stage so the form is usable again on error
+      setUploadStage("");
     } finally {
-      setIsSubmitting(false); // added: always release the lock, success or failure
+      // Always release both the ref and the state lock
+      isSubmittingRef.current = false;
+      setIsSubmitting(false);
     }
   };
 
@@ -144,10 +165,10 @@ export default function UploadPage() {
     setRawFiles([]);
     setForm(EMPTY_FORM);
     setErrors({});
-    setUploadStage(""); // added
+    setUploadStage("");
   };
 
-  // ── Render: success state ───────────────────────────────────────────────────
+  // ── Render: success ─────────────────────────────────────────────────────────
   if (submitted) {
     return (
       <UploadSuccessModal
@@ -170,7 +191,6 @@ export default function UploadPage() {
         boxSizing: "border-box",
       }}
     >
-      {/* Page heading */}
       <div style={{ marginBottom: "24px" }}>
         <h2
           style={{
@@ -183,7 +203,7 @@ export default function UploadPage() {
           Upload Study
         </h2>
         <p style={{ fontSize: "13px", color: "#6b7280", margin: "4px 0 0 0" }}>
-          Upload  to the PACS server
+          Upload to the PACS server
         </p>
       </div>
 
@@ -213,9 +233,7 @@ export default function UploadPage() {
         </div>
       </div>
 
-      {/* added: visible "uploading" banner — only shows while a real network
-          upload is in flight, so the user gets feedback instead of clicking
-          submit again */}
+      {/* Upload-in-progress banner */}
       {isSubmitting && (
         <div
           style={{
@@ -241,7 +259,7 @@ export default function UploadPage() {
             }}
           />
           <div style={{ fontSize: "13px", color: "#9a3412", fontWeight: 600 }}>
-            Uploading… {uploadStage}
+            {uploadStage}
           </div>
           <style>{`@keyframes upload-spin { from { transform: rotate(0deg) } to { transform: rotate(360deg) } }`}</style>
         </div>
@@ -255,7 +273,6 @@ export default function UploadPage() {
           gap: "20px",
         }}
       >
-        {/* Left column */}
         <div style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
           <DicomDropZone
             files={files}
@@ -268,11 +285,10 @@ export default function UploadPage() {
             isMobile={isMobile}
             onChange={patchForm}
             onSubmit={handleSubmit}
-            isSubmitting={isSubmitting} // added: pass down so the button can disable + relabel
+            isSubmitting={isSubmitting}
           />
         </div>
 
-        {/* Right column */}
         <div style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
           <PacsConnectionCard />
           <ConnectedDevicesCard />
