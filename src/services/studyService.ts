@@ -65,6 +65,7 @@ export class ApiError extends Error {
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+// Replace apiFetch with this version that handles empty responses
 async function apiFetch<T>(
   url: string,
   options?: RequestInit,
@@ -75,7 +76,12 @@ async function apiFetch<T>(
     if (attempt > 0) await sleep(300 * 2 ** (attempt - 1));
     try {
       const res = await fetch(url, options);
-      if (res.ok) return res.json() as Promise<T>;
+      if (res.ok) {
+        // 204 No Content and 205 Reset Content have no body — don't parse
+        if (res.status === 204 || res.status === 205) return undefined as T;
+        const text = await res.text();
+        return text ? (JSON.parse(text) as T) : (undefined as T);
+      }
       const body = await res.text();
       if (res.status < 500) throw new ApiError(res.status, body);
       lastErr = new ApiError(res.status, body);
