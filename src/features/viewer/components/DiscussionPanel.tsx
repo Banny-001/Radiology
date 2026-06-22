@@ -13,7 +13,7 @@ export function DiscussionPanel({
   comment: string;
   setComment: (v: string) => void;
   onPost: () => void;
-  commentEndRef: React.RefObject<HTMLDivElement>;
+  commentEndRef: React.RefObject<HTMLDivElement | null>;
 }) {
   const ROLE_LABELS: Record<string, string> = {
     radiologist: "Radiologist",
