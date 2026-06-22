@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "deploy": "ssh root@68.183.133.101 \"cd /var/www/radiography && git pull origin main && tsc -b && npx vite build\""
   },
   "dependencies": {
     "@headlessui/react": "^2.2.10",
