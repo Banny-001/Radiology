@@ -45,41 +45,45 @@ export default function DicomViewer({
   onImageIndexChange,
 }: DicomViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const [error, setError]           = useState<string | null>(null);
-  const [loading, setLoading]       = useState(true);
-  const [fileList, setFileList]     = useState<string[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [fileList, setFileList] = useState<string[]>([]);
   const [imageLoaded, setImageLoaded] = useState(false);
 
   // Local slice index: driven by the prop but can also be incremented by swipe
   const [localIndex, setLocalIndex] = useState(imageIndex);
-  useEffect(() => { setLocalIndex(imageIndex); }, [imageIndex]);
+  useEffect(() => {
+    setLocalIndex(imageIndex);
+  }, [imageIndex]);
 
   const csEnabledRef = useRef(false);
 
   // ── Refs that keep current values accessible inside non-reactive DOM handlers
-  const localIndexRef        = useRef(localIndex);
-  const seriesFileListRef    = useRef<string[]>([]);
+  const localIndexRef = useRef(localIndex);
+  const seriesFileListRef = useRef<string[]>([]);
   const onImageIndexChangeRef = useRef(onImageIndexChange);
 
   // Update every render — safe to do outside useEffect for refs
-  localIndexRef.current         = localIndex;
+  localIndexRef.current = localIndex;
   onImageIndexChangeRef.current = onImageIndexChange;
 
   // ── Series partitioning ───────────────────────────────────────────────────
   const seriesFileList = (() => {
     if (fileList.length === 0 || seriesCount <= 1) return fileList;
     const chunkSize = Math.max(1, Math.floor(fileList.length / seriesCount));
-    const start     = activeSeries * chunkSize;
-    const end       = activeSeries === seriesCount - 1 ? fileList.length : start + chunkSize;
+    const start = activeSeries * chunkSize;
+    const end =
+      activeSeries === seriesCount - 1 ? fileList.length : start + chunkSize;
     return fileList.slice(start, end);
   })();
 
   // Keep the ref up-to-date so DOM handlers always see the current list
   seriesFileListRef.current = seriesFileList;
 
-  const safeIndex = seriesFileList.length > 0
-    ? Math.max(0, Math.min(seriesFileList.length - 1, localIndex))
-    : 0;
+  const safeIndex =
+    seriesFileList.length > 0
+      ? Math.max(0, Math.min(seriesFileList.length - 1, localIndex))
+      : 0;
 
   // ── Fetch file list ───────────────────────────────────────────────────────
   useEffect(() => {
@@ -107,7 +111,7 @@ export default function DicomViewer({
     if (!window.cornerstone) {
       setError(
         "Cornerstone not initialized.\n\n" +
-        "Make sure main.tsx has cornerstone initialization with WADO loader registration.",
+          "Make sure main.tsx has cornerstone initialization with WADO loader registration.",
       );
       return;
     }
@@ -120,7 +124,11 @@ export default function DicomViewer({
     }
 
     return () => {
-      try { window.cornerstone.disable(el); } catch { /* element may already be gone */ }
+      try {
+        window.cornerstone.disable(el);
+      } catch {
+        /* element may already be gone */
+      }
       csEnabledRef.current = false;
     };
   }, []);
@@ -148,8 +156,12 @@ export default function DicomViewer({
         setImageLoaded(false);
 
         const currentFile = seriesFileList[safeIndex];
-        const imageUrl    = `wadouri:/dicom/${studyId}/${encodeURIComponent(currentFile)}`;
-        const image       = await window.cornerstone.loadImage(imageUrl);
+        // The backend now serves DICOM bytes at /api/v1/studies/{id}/dicom/{filename}.
+        // Previously this pointed at /dicom/{id}/{...} which had no matching route
+        // anywhere (no FastAPI handler, no Nginx static block) — every fetch
+        // returned 404 and Cornerstone failed silently, leaving the viewer blank.
+        const imageUrl = `wadouri:/api/v1/studies/${studyId}/dicom/${encodeURIComponent(currentFile)}`;
+        const image = await window.cornerstone.loadImage(imageUrl);
 
         // Guard: component may have unmounted during the async gap
         if (!csEnabledRef.current) return;
@@ -178,11 +190,11 @@ export default function DicomViewer({
     try {
       const viewport = window.cornerstone.getViewport(el);
       if (!viewport) return;
-      viewport.scale       = zoom;
-      viewport.rotation    = rotation;
-      viewport.hflip       = flipH;
-      viewport.vflip       = flipV;
-      viewport.invert      = isInverted;
+      viewport.scale = zoom;
+      viewport.rotation = rotation;
+      viewport.hflip = flipH;
+      viewport.vflip = flipV;
+      viewport.invert = isInverted;
       viewport.translation = { x: offsetX, y: offsetY };
       window.cornerstone.setViewport(el, viewport);
       // ↑ setViewport triggers one render; updateImage forces a second pass that
@@ -212,8 +224,8 @@ export default function DicomViewer({
     // ── Touch state (local to this effect closure) ──────────────────────────
     let touchStartX: number | null = null;
     let touchStartY: number | null = null;
-    let pinchDist: number | null   = null;
-    let isPinching                  = false;
+    let pinchDist: number | null = null;
+    let isPinching = false;
 
     const getDistance = (a: Touch, b: Touch) =>
       Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
@@ -221,10 +233,15 @@ export default function DicomViewer({
     const fireMouseEvent = (type: string, touch: Touch, buttons = 1) => {
       el.dispatchEvent(
         new MouseEvent(type, {
-          bubbles: true, cancelable: true, view: window,
-          button: 0, buttons,
-          clientX: touch.clientX, clientY: touch.clientY,
-          screenX: touch.screenX, screenY: touch.screenY,
+          bubbles: true,
+          cancelable: true,
+          view: window,
+          button: 0,
+          buttons,
+          clientX: touch.clientX,
+          clientY: touch.clientY,
+          screenX: touch.screenX,
+          screenY: touch.screenY,
         }),
       );
     };
@@ -236,14 +253,20 @@ export default function DicomViewer({
       if (e.touches.length === 2) {
         // Entering pinch — end any ongoing single-finger interaction first
         isPinching = true;
-        pinchDist  = getDistance(e.touches[0], e.touches[1]);
+        pinchDist = getDistance(e.touches[0], e.touches[1]);
         el.dispatchEvent(
-          new MouseEvent("mouseup", { bubbles: true, cancelable: true, view: window, button: 0, buttons: 0 }),
+          new MouseEvent("mouseup", {
+            bubbles: true,
+            cancelable: true,
+            view: window,
+            button: 0,
+            buttons: 0,
+          }),
         );
       } else if (e.touches.length === 1) {
-        isPinching   = false;
-        touchStartX  = e.touches[0].clientX;
-        touchStartY  = e.touches[0].clientY;
+        isPinching = false;
+        touchStartX = e.touches[0].clientX;
+        touchStartY = e.touches[0].clientY;
         fireMouseEvent("mousedown", e.touches[0]);
       }
     };
@@ -255,8 +278,8 @@ export default function DicomViewer({
       if (e.touches.length === 2 && pinchDist !== null) {
         // Pinch-to-zoom: scale viewport directly so Cornerstone tools see the change
         const newDist = getDistance(e.touches[0], e.touches[1]);
-        const delta   = newDist / pinchDist;
-        pinchDist     = newDist;
+        const delta = newDist / pinchDist;
+        pinchDist = newDist;
 
         if (!csEnabledRef.current) return;
         try {
@@ -267,8 +290,9 @@ export default function DicomViewer({
           // updateImage redraws annotation overlays at the new scale —
           // this is what keeps angle/length labels current during pinch
           window.cornerstone.updateImage(el);
-        } catch { /* ignore mid-gesture errors */ }
-
+        } catch {
+          /* ignore mid-gesture errors */
+        }
       } else if (e.touches.length === 1 && !isPinching) {
         // Single-finger pan → forward to Cornerstone active tool
         fireMouseEvent("mousemove", e.touches[0]);
@@ -281,7 +305,7 @@ export default function DicomViewer({
 
       if (isPinching) {
         isPinching = false;
-        pinchDist  = null;
+        pinchDist = null;
         // No swipe interpretation at the end of a pinch
       } else if (
         e.changedTouches.length === 1 &&
@@ -313,7 +337,11 @@ export default function DicomViewer({
       // Always fire mouseup so Cornerstone tools complete their interaction
       el.dispatchEvent(
         new MouseEvent("mouseup", {
-          bubbles: true, cancelable: true, view: window, button: 0, buttons: 0,
+          bubbles: true,
+          cancelable: true,
+          view: window,
+          button: 0,
+          buttons: 0,
         }),
       );
 
@@ -323,13 +351,13 @@ export default function DicomViewer({
 
     const opts: AddEventListenerOptions = { passive: false };
     el.addEventListener("touchstart", onStart, opts);
-    el.addEventListener("touchmove",  onMove,  opts);
-    el.addEventListener("touchend",   onEnd,   opts);
+    el.addEventListener("touchmove", onMove, opts);
+    el.addEventListener("touchend", onEnd, opts);
 
     return () => {
       el.removeEventListener("touchstart", onStart);
-      el.removeEventListener("touchmove",  onMove);
-      el.removeEventListener("touchend",   onEnd);
+      el.removeEventListener("touchmove", onMove);
+      el.removeEventListener("touchend", onEnd);
     };
   }, []); // intentionally empty — all live values accessed via refs
 
@@ -338,11 +366,21 @@ export default function DicomViewer({
     return (
       <div
         style={{
-          width: "100%", height: "100%", background: "#000",
-          display: "flex", alignItems: "center", justifyContent: "center",
-          flexDirection: "column", gap: "12px", padding: "20px",
-          color: "#ef4444", fontSize: "12px", fontFamily: "monospace",
-          whiteSpace: "pre-wrap", overflow: "auto", textAlign: "center",
+          width: "100%",
+          height: "100%",
+          background: "#000",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          flexDirection: "column",
+          gap: "12px",
+          padding: "20px",
+          color: "#ef4444",
+          fontSize: "12px",
+          fontFamily: "monospace",
+          whiteSpace: "pre-wrap",
+          overflow: "auto",
+          textAlign: "center",
         }}
       >
         <AlertCircle size={24} style={{ flexShrink: 0 }} />
@@ -374,10 +412,14 @@ export default function DicomViewer({
       {loading && (
         <div
           style={{
-            position: "absolute", inset: 0,
+            position: "absolute",
+            inset: 0,
             background: "rgba(0,0,0,0.6)",
-            display: "flex", alignItems: "center", justifyContent: "center",
-            color: "#9ca3af", fontSize: "12px",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            color: "#9ca3af",
+            fontSize: "12px",
           }}
         >
           Loading DICOM...

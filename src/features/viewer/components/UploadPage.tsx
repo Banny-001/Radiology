@@ -1,6 +1,12 @@
 import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
-import { AlertTriangle, ChevronDown, ChevronUp, FileArchive, Files } from "lucide-react";
+import {
+  AlertTriangle,
+  ChevronDown,
+  ChevronUp,
+  FileArchive,
+  Files,
+} from "lucide-react";
 import PacsConnectionCard from "../Pacsconnectioncard";
 import { type UploadedFile, type PatientForm, EMPTY_FORM } from "../types";
 import AutoArrivalGuide from "./Autoarrivalguide";
@@ -8,7 +14,11 @@ import ConnectedDevicesCard from "./Connecteddevicescard";
 import DicomDropZone from "./Dicomdropzone";
 import PatientInfoForm from "./Patientinfoform";
 import UploadSuccessModal from "./Uploadsuccessmodal";
-import { createStudy, uploadDicomBatch } from "../../../services/studyService";
+import {
+  createStudy,
+  uploadDicomBatch,
+  deleteStudy,
+} from "../../../services/studyService";
 import { useStudies } from "../../../context/StudyContext";
 
 const formatSize = (bytes: number) => {
@@ -23,24 +33,24 @@ const fileKey = (f: File) => `${f.name}-${f.size}`;
 const AUTO_COLLAPSE_AT = 5;
 
 export default function UploadPage() {
-  const navigate    = useNavigate();
+  const navigate = useNavigate();
   const { refresh } = useStudies();
 
-  const [isMobile, setIsMobile]               = useState(window.innerWidth < 768);
-  const [files, setFiles]                     = useState<UploadedFile[]>([]);
-  const [form, setForm]                       = useState<PatientForm>(EMPTY_FORM);
-  const [errors, setErrors]                   = useState<Record<string, string>>({});
-  const [submitted, setSubmitted]             = useState(false);
-  const [rawFiles, setRawFiles]               = useState<File[]>([]);
-  const [isSubmitting, setIsSubmitting]       = useState(false);
-  const [uploadStage, setUploadStage]         = useState<string>("");
-  const [uploadError, setUploadError]         = useState<string>("");
-  const [filesExpanded, setFilesExpanded]     = useState(true);
+  const [isMobile, setIsMobile] = useState(window.innerWidth < 768);
+  const [files, setFiles] = useState<UploadedFile[]>([]);
+  const [form, setForm] = useState<PatientForm>(EMPTY_FORM);
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [submitted, setSubmitted] = useState(false);
+  const [rawFiles, setRawFiles] = useState<File[]>([]);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [uploadStage, setUploadStage] = useState<string>("");
+  const [uploadError, setUploadError] = useState<string>("");
+  const [filesExpanded, setFilesExpanded] = useState(true);
   const [isExtractingZip, setIsExtractingZip] = useState(false);
-  const [extractionMsg, setExtractionMsg]     = useState("");
+  const [extractionMsg, setExtractionMsg] = useState("");
 
   const isSubmittingRef = useRef(false);
-  const formRef         = useRef<HTMLDivElement>(null);
+  const formRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const handler = () => setIsMobile(window.innerWidth < 768);
@@ -68,8 +78,10 @@ export default function UploadPage() {
 
   // ── File handling ──────────────────────────────────────────────────────────
   const addFiles = async (incoming: File[]) => {
-    const zips   = incoming.filter(f => f.name.toLowerCase().endsWith(".zip"));
-    let allFiles = incoming.filter(f => !f.name.toLowerCase().endsWith(".zip"));
+    const zips = incoming.filter((f) => f.name.toLowerCase().endsWith(".zip"));
+    let allFiles = incoming.filter(
+      (f) => !f.name.toLowerCase().endsWith(".zip"),
+    );
 
     // ── Step 1: expand ZIPs ──────────────────────────────────────────────────
     if (zips.length > 0) {
@@ -92,7 +104,7 @@ export default function UploadPage() {
         setExtractionMsg("⚠  Extraction failed — check browser console");
       } finally {
         // Hold the banner briefly so the user can read the result
-        await new Promise<void>(r => setTimeout(r, 800));
+        await new Promise<void>((r) => setTimeout(r, 800));
         setIsExtractingZip(false);
       }
     }
@@ -100,40 +112,44 @@ export default function UploadPage() {
     // ── Step 2: deduplicate & queue ──────────────────────────────────────────
     // Using a functional update so `prevRaw` is always the latest state,
     // even if addFiles is called concurrently (e.g. multiple rapid drops).
-    setRawFiles(prevRaw => {
+    setRawFiles((prevRaw) => {
       const existingKeys = new Set(prevRaw.map(fileKey));
-      const fresh = allFiles.filter(f => !existingKeys.has(fileKey(f)));
+      const fresh = allFiles.filter((f) => !existingKeys.has(fileKey(f)));
       if (fresh.length === 0) return prevRaw;
 
-      const startIdx   = prevRaw.length;
+      const startIdx = prevRaw.length;
       const totalAfter = startIdx + fresh.length;
 
       // Auto-collapse so the form is reachable without scrolling
       if (totalAfter > AUTO_COLLAPSE_AT) setFilesExpanded(false);
 
-      const mapped: UploadedFile[] = fresh.map(f => ({
+      const mapped: UploadedFile[] = fresh.map((f) => ({
         name: f.name,
         size: formatSize(f.size),
         progress: 0,
         done: false,
       }));
 
-      setFiles(pf => [...pf, ...mapped]);
+      setFiles((pf) => [...pf, ...mapped]);
 
       // Animate per-file scan progress
       mapped.forEach((_, i) => {
         const idx = startIdx + i;
-        let prog  = 0;
-        const iv  = setInterval(() => {
+        let prog = 0;
+        const iv = setInterval(() => {
           prog += Math.random() * 20 + 10;
           if (prog >= 100) {
             clearInterval(iv);
-            setFiles(pf =>
-              pf.map((f, fi) => fi === idx ? { ...f, progress: 100, done: true } : f),
+            setFiles((pf) =>
+              pf.map((f, fi) =>
+                fi === idx ? { ...f, progress: 100, done: true } : f,
+              ),
             );
           } else {
-            setFiles(pf =>
-              pf.map((f, fi) => fi === idx ? { ...f, progress: Math.round(prog) } : f),
+            setFiles((pf) =>
+              pf.map((f, fi) =>
+                fi === idx ? { ...f, progress: Math.round(prog) } : f,
+              ),
             );
           }
         }, 300);
@@ -144,19 +160,19 @@ export default function UploadPage() {
   };
 
   const removeFile = (idx: number) => {
-    setFiles(pf   => pf.filter((_, i) => i !== idx));
-    setRawFiles(pr => pr.filter((_, i) => i !== idx));
+    setFiles((pf) => pf.filter((_, i) => i !== idx));
+    setRawFiles((pr) => pr.filter((_, i) => i !== idx));
   };
 
   // ── Form handling ──────────────────────────────────────────────────────────
   const patchForm = (patch: Partial<PatientForm>) =>
-    setForm(p => ({ ...p, ...patch }));
+    setForm((p) => ({ ...p, ...patch }));
 
   const validate = () => {
     const e: Record<string, string> = {};
     if (!form.patientName) e.patientName = "Required";
-    if (!form.patientId)   e.patientId   = "Required";
-    if (!form.modality)    e.modality    = "Required";
+    if (!form.patientId) e.patientId = "Required";
+    if (!form.modality) e.modality = "Required";
     if (!form.description) e.description = "Required";
     setErrors(e);
     return Object.keys(e).length === 0;
@@ -173,16 +189,16 @@ export default function UploadPage() {
       // 1. Create study record
       setUploadStage("Creating study record…");
       const study = await createStudy({
-        patient_name:     form.patientName,
-        patient_id:       form.patientId,
-        date_of_birth:    form.dob             || undefined,
-        sex:              form.sex             || undefined,
-        modality:         form.modality,
-        description:      form.description,
+        patient_name: form.patientName,
+        patient_id: form.patientId,
+        date_of_birth: form.dob || undefined,
+        sex: form.sex || undefined,
+        modality: form.modality,
+        description: form.description,
         referring_doctor: form.referringDoctor || undefined,
-        institution:      form.institution     || undefined,
+        institution: form.institution || undefined,
         clinical_history: form.clinicalHistory || undefined,
-        is_urgent:        form.urgent,
+        is_urgent: form.urgent,
       });
 
       // 2. Bundle all files into one ZIP and send a single request
@@ -192,22 +208,35 @@ export default function UploadPage() {
             ? "Uploading 1 DICOM file…"
             : `Bundling ${rawFiles.length} DICOM files & uploading…`,
         );
-        await uploadDicomBatch(study.id, rawFiles);
+        try {
+          await uploadDicomBatch(study.id, rawFiles);
+        } catch (uploadErr) {
+          // File upload failed — delete the orphan study record immediately.
+          // Without this, a "pending / 0 images" row lingers in the worklist
+          // and the user thinks the upload completed when it didn't.
+          setUploadStage("Cleaning up…");
+          try {
+            await deleteStudy(study.id);
+          } catch {
+            /* best-effort */
+          }
+          throw uploadErr; // re-throw → outer catch shows the error banner
+        }
       }
 
       // 3. Await refresh BEFORE showing the modal so the worklist is already
       //    current when the user clicks "View in Worklist".
-      //    Previously `void refresh()` was fire-and-forget, causing a stale list.
       setUploadStage("Refreshing worklist…");
       await refresh();
 
       // 4. Show success — this unmounts the form, preventing a second submit
       setSubmitted(true);
-
     } catch (err) {
       console.error("Upload failed:", err);
       setUploadError(
-        err instanceof Error ? err.message : "Upload failed — please try again.",
+        err instanceof Error
+          ? err.message
+          : "Upload failed — please try again.",
       );
       setUploadStage("");
     } finally {
@@ -239,22 +268,38 @@ export default function UploadPage() {
   }
 
   // ── Derived values ─────────────────────────────────────────────────────────
-  const doneCount  = files.filter(f => f.done).length;
-  const overallPct = files.length === 0
-    ? 0
-    : Math.round(files.reduce((sum, f) => sum + f.progress, 0) / files.length);
+  const doneCount = files.filter((f) => f.done).length;
+  const overallPct =
+    files.length === 0
+      ? 0
+      : Math.round(
+          files.reduce((sum, f) => sum + f.progress, 0) / files.length,
+        );
   const hasFiles = files.length > 0;
-  const pad      = isMobile ? "16px" : "32px";
+  const pad = isMobile ? "16px" : "32px";
 
   return (
-    <div style={{ padding: pad, background: "#F8FAFF", minHeight: "100%", boxSizing: "border-box" }}>
-
+    <div
+      style={{
+        padding: pad,
+        background: "#F8FAFF",
+        minHeight: "100%",
+        boxSizing: "border-box",
+      }}
+    >
       {/* Single keyframes definition shared by all spinners */}
       <style>{`@keyframes spin { from { transform:rotate(0deg) } to { transform:rotate(360deg) } }`}</style>
 
       {/* ── Header ──────────────────────────────────────────────────────────── */}
       <div style={{ marginBottom: "24px" }}>
-        <h2 style={{ fontSize: isMobile ? "20px" : "24px", fontWeight: 700, color: "#111827", margin: 0 }}>
+        <h2
+          style={{
+            fontSize: isMobile ? "20px" : "24px",
+            fontWeight: 700,
+            color: "#111827",
+            margin: 0,
+          }}
+        >
           Upload Study
         </h2>
         <p style={{ fontSize: "13px", color: "#6b7280", margin: "4px 0 0 0" }}>
@@ -263,43 +308,114 @@ export default function UploadPage() {
       </div>
 
       {/* ── Auto-arrival info banner ─────────────────────────────────────────── */}
-      <div style={{ background: "#EBF3FF", border: "1px solid #bfdbfe", borderRadius: "12px", padding: "14px 16px", marginBottom: "24px", display: "flex", alignItems: "flex-start", gap: "10px" }}>
-        <AlertTriangle size={16} color="#1A73E8" style={{ flexShrink: 0, marginTop: "1px" }} />
+      <div
+        style={{
+          background: "#EBF3FF",
+          border: "1px solid #bfdbfe",
+          borderRadius: "12px",
+          padding: "14px 16px",
+          marginBottom: "24px",
+          display: "flex",
+          alignItems: "flex-start",
+          gap: "10px",
+        }}
+      >
+        <AlertTriangle
+          size={16}
+          color="#1A73E8"
+          style={{ flexShrink: 0, marginTop: "1px" }}
+        />
         <div style={{ fontSize: "13px", color: "#1e40af", lineHeight: 1.5 }}>
-          <strong>How studies arrive automatically:</strong> CT, MRI, and X-ray machines can be configured to send images directly to this PACS server. No manual upload needed — the study appears in the worklist immediately.
+          <strong>How studies arrive automatically:</strong> CT, MRI, and X-ray
+          machines can be configured to send images directly to this PACS
+          server. No manual upload needed — the study appears in the worklist
+          immediately.
         </div>
       </div>
 
       {/* ── ZIP extraction banner ────────────────────────────────────────────── */}
       {isExtractingZip && (
-        <div style={{ background: "#F0FDF4", border: "1px solid #bbf7d0", borderRadius: "12px", padding: "14px 16px", marginBottom: "24px", display: "flex", alignItems: "center", gap: "10px" }}>
+        <div
+          style={{
+            background: "#F0FDF4",
+            border: "1px solid #bbf7d0",
+            borderRadius: "12px",
+            padding: "14px 16px",
+            marginBottom: "24px",
+            display: "flex",
+            alignItems: "center",
+            gap: "10px",
+          }}
+        >
           <FileArchive size={16} color="#16a34a" style={{ flexShrink: 0 }} />
-          <span style={{ fontSize: "13px", color: "#166534", fontWeight: 600 }}>{extractionMsg}</span>
+          <span style={{ fontSize: "13px", color: "#166534", fontWeight: 600 }}>
+            {extractionMsg}
+          </span>
         </div>
       )}
 
       {/* ── Upload in-progress banner ────────────────────────────────────────── */}
       {isSubmitting && (
-        <div style={{ background: "#FFF7ED", border: "1px solid #fed7aa", borderRadius: "12px", padding: "14px 16px", marginBottom: "24px", display: "flex", alignItems: "center", gap: "10px" }}>
-          <div style={{ width: "16px", height: "16px", border: "2px solid #fed7aa", borderTopColor: "#EA580C", borderRadius: "50%", animation: "spin 0.8s linear infinite", flexShrink: 0 }} />
-          <span style={{ fontSize: "13px", color: "#9a3412", fontWeight: 600 }}>{uploadStage}</span>
+        <div
+          style={{
+            background: "#FFF7ED",
+            border: "1px solid #fed7aa",
+            borderRadius: "12px",
+            padding: "14px 16px",
+            marginBottom: "24px",
+            display: "flex",
+            alignItems: "center",
+            gap: "10px",
+          }}
+        >
+          <div
+            style={{
+              width: "16px",
+              height: "16px",
+              border: "2px solid #fed7aa",
+              borderTopColor: "#EA580C",
+              borderRadius: "50%",
+              animation: "spin 0.8s linear infinite",
+              flexShrink: 0,
+            }}
+          />
+          <span style={{ fontSize: "13px", color: "#9a3412", fontWeight: 600 }}>
+            {uploadStage}
+          </span>
         </div>
       )}
 
       {/* ── Upload error banner ──────────────────────────────────────────────── */}
       {uploadError && (
-        <div style={{ background: "#FEF2F2", border: "1px solid #fecaca", borderRadius: "12px", padding: "14px 16px", marginBottom: "24px", display: "flex", alignItems: "center", gap: "10px" }}>
+        <div
+          style={{
+            background: "#FEF2F2",
+            border: "1px solid #fecaca",
+            borderRadius: "12px",
+            padding: "14px 16px",
+            marginBottom: "24px",
+            display: "flex",
+            alignItems: "center",
+            gap: "10px",
+          }}
+        >
           <AlertTriangle size={16} color="#dc2626" style={{ flexShrink: 0 }} />
-          <span style={{ fontSize: "13px", color: "#991b1b", fontWeight: 600 }}>{uploadError}</span>
+          <span style={{ fontSize: "13px", color: "#991b1b", fontWeight: 600 }}>
+            {uploadError}
+          </span>
         </div>
       )}
 
       {/* ── Two-column layout ────────────────────────────────────────────────── */}
-      <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr", gap: "20px" }}>
-
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr",
+          gap: "20px",
+        }}
+      >
         {/* ─── Left column ──────────────────────────────────────────────────── */}
         <div style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
-
           {/* ── File section ──────────────────────────────────────────────────── */}
           <div>
             {/* Collapse / expand toggle — appears once files are queued */}
@@ -307,9 +423,11 @@ export default function UploadPage() {
               <div
                 role="button"
                 aria-expanded={filesExpanded}
-                onClick={() => setFilesExpanded(v => !v)}
+                onClick={() => setFilesExpanded((v) => !v)}
                 style={{
-                  display: "flex", alignItems: "center", justifyContent: "space-between",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
                   background: "#fff",
                   border: "1px solid #e5e7eb",
                   borderBottom: filesExpanded ? "none" : undefined,
@@ -320,9 +438,17 @@ export default function UploadPage() {
                 }}
               >
                 {/* Left: file count + scan status */}
-                <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                <div
+                  style={{ display: "flex", alignItems: "center", gap: "8px" }}
+                >
                   <Files size={15} color="#6b7280" />
-                  <span style={{ fontSize: "13px", fontWeight: 600, color: "#374151" }}>
+                  <span
+                    style={{
+                      fontSize: "13px",
+                      fontWeight: 600,
+                      color: "#374151",
+                    }}
+                  >
                     {files.length} file{files.length !== 1 ? "s" : ""}
                     {" · "}
                     {doneCount < files.length
@@ -332,24 +458,46 @@ export default function UploadPage() {
                 </div>
 
                 {/* Right: mini progress bar when collapsed + chevron */}
-                <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                <div
+                  style={{ display: "flex", alignItems: "center", gap: "10px" }}
+                >
                   {!filesExpanded && (
                     <>
-                      <div style={{ width: "72px", height: "4px", background: "#f3f4f6", borderRadius: "2px" }}>
-                        <div style={{
-                          width: `${overallPct}%`, height: "100%",
-                          background: "#1A73E8", borderRadius: "2px",
-                          transition: "width 0.3s",
-                        }} />
+                      <div
+                        style={{
+                          width: "72px",
+                          height: "4px",
+                          background: "#f3f4f6",
+                          borderRadius: "2px",
+                        }}
+                      >
+                        <div
+                          style={{
+                            width: `${overallPct}%`,
+                            height: "100%",
+                            background: "#1A73E8",
+                            borderRadius: "2px",
+                            transition: "width 0.3s",
+                          }}
+                        />
                       </div>
-                      <span style={{ fontSize: "11px", color: "#6b7280", minWidth: "28px", textAlign: "right" }}>
+                      <span
+                        style={{
+                          fontSize: "11px",
+                          color: "#6b7280",
+                          minWidth: "28px",
+                          textAlign: "right",
+                        }}
+                      >
                         {overallPct}%
                       </span>
                     </>
                   )}
-                  {filesExpanded
-                    ? <ChevronUp   size={15} color="#6b7280" />
-                    : <ChevronDown size={15} color="#6b7280" />}
+                  {filesExpanded ? (
+                    <ChevronUp size={15} color="#6b7280" />
+                  ) : (
+                    <ChevronDown size={15} color="#6b7280" />
+                  )}
                 </div>
               </div>
             )}
@@ -368,9 +516,14 @@ export default function UploadPage() {
               <button
                 onClick={() => setFilesExpanded(true)}
                 style={{
-                  marginTop: "6px", width: "100%", padding: "9px",
-                  background: "transparent", border: "1.5px dashed #d1d5db",
-                  borderRadius: "10px", color: "#6b7280", fontSize: "13px",
+                  marginTop: "6px",
+                  width: "100%",
+                  padding: "9px",
+                  background: "transparent",
+                  border: "1.5px dashed #d1d5db",
+                  borderRadius: "10px",
+                  color: "#6b7280",
+                  fontSize: "13px",
                   cursor: "pointer",
                 }}
               >
@@ -382,12 +535,19 @@ export default function UploadPage() {
           {/* ── Jump-to-form shortcut ────────────────────────────────────────── */}
           {hasFiles && (
             <button
-              onClick={() => formRef.current?.scrollIntoView({ behavior: "smooth" })}
+              onClick={() =>
+                formRef.current?.scrollIntoView({ behavior: "smooth" })
+              }
               style={{
-                padding: "9px 16px", background: "#EBF3FF",
-                border: "1px solid #bfdbfe", borderRadius: "10px",
-                color: "#1A73E8", fontSize: "13px", fontWeight: 600,
-                cursor: "pointer", width: "100%",
+                padding: "9px 16px",
+                background: "#EBF3FF",
+                border: "1px solid #bfdbfe",
+                borderRadius: "10px",
+                color: "#1A73E8",
+                fontSize: "13px",
+                fontWeight: 600,
+                cursor: "pointer",
+                width: "100%",
               }}
             >
               ↓ Jump to Patient Form
