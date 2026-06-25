@@ -25,6 +25,8 @@ interface DicomViewerProps {
   activeSeries?: number;
   seriesCount?: number;
   onFileCountChange?: (count: number) => void;
+  /** Called when the user swipes vertically on mobile to change slice */
+  onImageIndexChange?: (index: number) => void;
 }
 
 export default function DicomViewer({
@@ -40,45 +42,51 @@ export default function DicomViewer({
   activeSeries = 0,
   seriesCount = 1,
   onFileCountChange,
+  onImageIndexChange,
 }: DicomViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [fileList, setFileList] = useState<string[]>([]);
+  const [error, setError]           = useState<string | null>(null);
+  const [loading, setLoading]       = useState(true);
+  const [fileList, setFileList]     = useState<string[]>([]);
   const [imageLoaded, setImageLoaded] = useState(false);
 
-  // Tracks whether cornerstone.enable() has successfully run on this element.
-  // Using a ref (not state) so it doesn't trigger extra renders.
+  // Local slice index: driven by the prop but can also be incremented by swipe
+  const [localIndex, setLocalIndex] = useState(imageIndex);
+  useEffect(() => { setLocalIndex(imageIndex); }, [imageIndex]);
+
   const csEnabledRef = useRef(false);
 
+  // ── Refs that keep current values accessible inside non-reactive DOM handlers
+  const localIndexRef        = useRef(localIndex);
+  const seriesFileListRef    = useRef<string[]>([]);
+  const onImageIndexChangeRef = useRef(onImageIndexChange);
+
+  // Update every render — safe to do outside useEffect for refs
+  localIndexRef.current         = localIndex;
+  onImageIndexChangeRef.current = onImageIndexChange;
+
   // ── Series partitioning ───────────────────────────────────────────────────
-  // Partition the flat file list into `seriesCount` contiguous chunks and
-  // take the slice belonging to `activeSeries`. The backend gives us a single
-  // list per study, so this maps SERIES_MAP entries onto real files until
-  // the backend grows a proper series concept.
   const seriesFileList = (() => {
     if (fileList.length === 0 || seriesCount <= 1) return fileList;
     const chunkSize = Math.max(1, Math.floor(fileList.length / seriesCount));
-    const start = activeSeries * chunkSize;
-    const end =
-      activeSeries === seriesCount - 1 ? fileList.length : start + chunkSize;
+    const start     = activeSeries * chunkSize;
+    const end       = activeSeries === seriesCount - 1 ? fileList.length : start + chunkSize;
     return fileList.slice(start, end);
   })();
 
-  // Clamp the requested index to what's actually available in this series
-  const safeIndex =
-    seriesFileList.length > 0
-      ? Math.max(0, Math.min(seriesFileList.length - 1, imageIndex))
-      : 0;
+  // Keep the ref up-to-date so DOM handlers always see the current list
+  seriesFileListRef.current = seriesFileList;
+
+  const safeIndex = seriesFileList.length > 0
+    ? Math.max(0, Math.min(seriesFileList.length - 1, localIndex))
+    : 0;
 
   // ── Fetch file list ───────────────────────────────────────────────────────
   useEffect(() => {
     getDicomFileList(studyId)
       .then((files) => {
         setFileList(files);
-        if (files.length === 0) {
-          setError("No DICOM files found in this study");
-        }
+        if (files.length === 0) setError("No DICOM files found in this study");
       })
       .catch((err) => {
         console.error("[DicomViewer] Failed to fetch file list:", err);
@@ -89,10 +97,9 @@ export default function DicomViewer({
   // ── Report per-series file count to parent ────────────────────────────────
   useEffect(() => {
     onFileCountChange?.(seriesFileList.length);
-  }, [seriesFileList.length, activeSeries]);
+  }, [seriesFileList.length, activeSeries]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Initialize Cornerstone ONCE on mount ──────────────────────────────────
-  // Disables on unmount so Cornerstone's internal element registry stays clean.
+  // ── Initialize Cornerstone ONCE on mount ─────────────────────────────────
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
@@ -100,7 +107,7 @@ export default function DicomViewer({
     if (!window.cornerstone) {
       setError(
         "Cornerstone not initialized.\n\n" +
-          "Make sure main.tsx has cornerstone initialization with WADO loader registration.",
+        "Make sure main.tsx has cornerstone initialization with WADO loader registration.",
       );
       return;
     }
@@ -113,26 +120,18 @@ export default function DicomViewer({
     }
 
     return () => {
-      try {
-        window.cornerstone.disable(el);
-      } catch {
-        // ignore — element may already be gone
-      }
+      try { window.cornerstone.disable(el); } catch { /* element may already be gone */ }
       csEnabledRef.current = false;
     };
   }, []);
 
-  // ── Load current DICOM image ──────────────────────────────────────────────
+  // ── Load / switch DICOM image ─────────────────────────────────────────────
   useEffect(() => {
     if (seriesFileList.length === 0) return;
 
-    // Capture the DOM element synchronously — before any await — so we
-    // never operate on a stale ref value after an async gap.
     const el = containerRef.current;
     if (!el || !window.cornerstone) return;
 
-    // If cornerstone.enable() hasn't completed yet (both effects fire in the
-    // same React flush on first render), retry once after a short delay.
     if (!csEnabledRef.current) {
       const timer = setTimeout(() => {
         if (!csEnabledRef.current || !containerRef.current) return;
@@ -149,12 +148,10 @@ export default function DicomViewer({
         setImageLoaded(false);
 
         const currentFile = seriesFileList[safeIndex];
-        const imageUrl = `wadouri:/dicom/${studyId}/${encodeURIComponent(currentFile)}`;
-        const image = await window.cornerstone.loadImage(imageUrl);
+        const imageUrl    = `wadouri:/dicom/${studyId}/${encodeURIComponent(currentFile)}`;
+        const image       = await window.cornerstone.loadImage(imageUrl);
 
-        // Guard: component may have unmounted or Cornerstone disabled
-        // during the async loadImage call — bail out rather than calling
-        // displayImage on a detached element, which causes "element not enabled".
+        // Guard: component may have unmounted during the async gap
         if (!csEnabledRef.current) return;
 
         window.cornerstone.displayImage(element, image);
@@ -169,44 +166,183 @@ export default function DicomViewer({
     }
   }, [safeIndex, seriesFileList, studyId]);
 
-  // ── Apply viewport transformations ───────────────────────────────────────
+  // ── Apply viewport transformations ────────────────────────────────────────
+  //
+  // After setViewport(), updateImage() forces Cornerstone to re-render the full
+  // canvas — including all Cornerstone Tools annotation overlays (length lines,
+  // angle arcs, text labels). Without it, annotation labels can lag behind the
+  // new zoom level and show stale positions or values.
   useEffect(() => {
     if (!containerRef.current || !window.cornerstone || !imageLoaded) return;
+    const el = containerRef.current;
     try {
-      const viewport = window.cornerstone.getViewport(containerRef.current);
+      const viewport = window.cornerstone.getViewport(el);
       if (!viewport) return;
-      viewport.scale = zoom;
-      viewport.rotation = rotation;
-      viewport.hflip = flipH;
-      viewport.vflip = flipV;
-      viewport.invert = isInverted;
+      viewport.scale       = zoom;
+      viewport.rotation    = rotation;
+      viewport.hflip       = flipH;
+      viewport.vflip       = flipV;
+      viewport.invert      = isInverted;
       viewport.translation = { x: offsetX, y: offsetY };
-      window.cornerstone.setViewport(containerRef.current, viewport);
+      window.cornerstone.setViewport(el, viewport);
+      // ↑ setViewport triggers one render; updateImage forces a second pass that
+      //   redraws all tool layers — this is what keeps measurement values current
+      window.cornerstone.updateImage(el);
     } catch (err) {
       console.error("[DicomViewer] Viewport update failed:", err);
     }
   }, [zoom, rotation, flipH, flipV, isInverted, offsetX, offsetY, imageLoaded]);
+
+  // ── Mobile touch handling ─────────────────────────────────────────────────
+  //
+  // React 17+ may attach touch handlers as passive, which blocks preventDefault()
+  // and lets the browser hijack scroll. To guarantee non-passive semantics we add
+  // listeners directly to the DOM element with { passive: false }.
+  //
+  // Three gestures handled:
+  //   1. Single-finger pan   → forwarded as mousedown/mousemove/mouseup so the
+  //                            active Cornerstone tool (pan, wwwl, length, etc.) reacts
+  //   2. Two-finger pinch    → directly adjusts viewport.scale + calls updateImage
+  //                            so annotations stay visible at the new zoom
+  //   3. Vertical swipe      → changes the current slice (imageIndex) within the series
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    // ── Touch state (local to this effect closure) ──────────────────────────
+    let touchStartX: number | null = null;
+    let touchStartY: number | null = null;
+    let pinchDist: number | null   = null;
+    let isPinching                  = false;
+
+    const getDistance = (a: Touch, b: Touch) =>
+      Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+
+    const fireMouseEvent = (type: string, touch: Touch, buttons = 1) => {
+      el.dispatchEvent(
+        new MouseEvent(type, {
+          bubbles: true, cancelable: true, view: window,
+          button: 0, buttons,
+          clientX: touch.clientX, clientY: touch.clientY,
+          screenX: touch.screenX, screenY: touch.screenY,
+        }),
+      );
+    };
+
+    // ── touchstart ──────────────────────────────────────────────────────────
+    const onStart = (e: TouchEvent) => {
+      e.preventDefault();
+
+      if (e.touches.length === 2) {
+        // Entering pinch — end any ongoing single-finger interaction first
+        isPinching = true;
+        pinchDist  = getDistance(e.touches[0], e.touches[1]);
+        el.dispatchEvent(
+          new MouseEvent("mouseup", { bubbles: true, cancelable: true, view: window, button: 0, buttons: 0 }),
+        );
+      } else if (e.touches.length === 1) {
+        isPinching   = false;
+        touchStartX  = e.touches[0].clientX;
+        touchStartY  = e.touches[0].clientY;
+        fireMouseEvent("mousedown", e.touches[0]);
+      }
+    };
+
+    // ── touchmove ───────────────────────────────────────────────────────────
+    const onMove = (e: TouchEvent) => {
+      e.preventDefault();
+
+      if (e.touches.length === 2 && pinchDist !== null) {
+        // Pinch-to-zoom: scale viewport directly so Cornerstone tools see the change
+        const newDist = getDistance(e.touches[0], e.touches[1]);
+        const delta   = newDist / pinchDist;
+        pinchDist     = newDist;
+
+        if (!csEnabledRef.current) return;
+        try {
+          const vp = window.cornerstone.getViewport(el);
+          if (!vp) return;
+          vp.scale = Math.max(0.1, Math.min(10, vp.scale * delta));
+          window.cornerstone.setViewport(el, vp);
+          // updateImage redraws annotation overlays at the new scale —
+          // this is what keeps angle/length labels current during pinch
+          window.cornerstone.updateImage(el);
+        } catch { /* ignore mid-gesture errors */ }
+
+      } else if (e.touches.length === 1 && !isPinching) {
+        // Single-finger pan → forward to Cornerstone active tool
+        fireMouseEvent("mousemove", e.touches[0]);
+      }
+    };
+
+    // ── touchend ────────────────────────────────────────────────────────────
+    const onEnd = (e: TouchEvent) => {
+      e.preventDefault();
+
+      if (isPinching) {
+        isPinching = false;
+        pinchDist  = null;
+        // No swipe interpretation at the end of a pinch
+      } else if (
+        e.changedTouches.length === 1 &&
+        touchStartX !== null &&
+        touchStartY !== null
+      ) {
+        const dx = e.changedTouches[0].clientX - touchStartX;
+        const dy = e.changedTouches[0].clientY - touchStartY;
+
+        // Swipe: clearly more vertical than horizontal, and at least 30 px
+        const isSliceSwipe =
+          Math.abs(dy) > 30 && Math.abs(dy) > Math.abs(dx) * 1.5;
+
+        if (isSliceSwipe && seriesFileListRef.current.length > 1) {
+          // Swipe up (dy < 0) → advance to next slice; swipe down → previous
+          const direction = dy < 0 ? 1 : -1;
+          const next = Math.max(
+            0,
+            Math.min(
+              seriesFileListRef.current.length - 1,
+              localIndexRef.current + direction,
+            ),
+          );
+          setLocalIndex(next);
+          onImageIndexChangeRef.current?.(next);
+        }
+      }
+
+      // Always fire mouseup so Cornerstone tools complete their interaction
+      el.dispatchEvent(
+        new MouseEvent("mouseup", {
+          bubbles: true, cancelable: true, view: window, button: 0, buttons: 0,
+        }),
+      );
+
+      touchStartX = null;
+      touchStartY = null;
+    };
+
+    const opts: AddEventListenerOptions = { passive: false };
+    el.addEventListener("touchstart", onStart, opts);
+    el.addEventListener("touchmove",  onMove,  opts);
+    el.addEventListener("touchend",   onEnd,   opts);
+
+    return () => {
+      el.removeEventListener("touchstart", onStart);
+      el.removeEventListener("touchmove",  onMove);
+      el.removeEventListener("touchend",   onEnd);
+    };
+  }, []); // intentionally empty — all live values accessed via refs
 
   // ── Error state ───────────────────────────────────────────────────────────
   if (error) {
     return (
       <div
         style={{
-          width: "100%",
-          height: "100%",
-          background: "#000",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          flexDirection: "column",
-          gap: "12px",
-          padding: "20px",
-          color: "#ef4444",
-          fontSize: "12px",
-          fontFamily: "monospace",
-          whiteSpace: "pre-wrap",
-          overflow: "auto",
-          textAlign: "center",
+          width: "100%", height: "100%", background: "#000",
+          display: "flex", alignItems: "center", justifyContent: "center",
+          flexDirection: "column", gap: "12px", padding: "20px",
+          color: "#ef4444", fontSize: "12px", fontFamily: "monospace",
+          whiteSpace: "pre-wrap", overflow: "auto", textAlign: "center",
         }}
       >
         <AlertCircle size={24} style={{ flexShrink: 0 }} />
@@ -220,19 +356,28 @@ export default function DicomViewer({
     <div style={{ width: "100%", height: "100%", position: "relative" }}>
       <div
         ref={containerRef}
-        style={{ width: "100%", height: "100%", background: "#000" }}
+        style={{
+          width: "100%",
+          height: "100%",
+          background: "#000",
+          /**
+           * touch-action: none
+           * Tells the browser to hand ALL touch events to JavaScript without
+           * trying to pan/zoom the page itself. This is what makes single-finger
+           * pan and pinch-to-zoom work in the viewer without accidentally
+           * scrolling the surrounding page.
+           */
+          touchAction: "none",
+        }}
       />
+
       {loading && (
         <div
           style={{
-            position: "absolute",
-            inset: 0,
+            position: "absolute", inset: 0,
             background: "rgba(0,0,0,0.6)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            color: "#9ca3af",
-            fontSize: "12px",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            color: "#9ca3af", fontSize: "12px",
           }}
         >
           Loading DICOM...
