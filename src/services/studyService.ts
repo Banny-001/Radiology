@@ -373,7 +373,8 @@ export function getDicomFileList(studyId: string): Promise<string[]> {
       undefined,
       2,
     );
-    const files = data.files ?? [];
+    // const files = data.files ?? [];
+    const files = (data.files ?? []).filter((f: string) => f !== "DICOMDIR");
     fileListCache.set(cacheKey, files, TTL.fileList);
     return files;
   });

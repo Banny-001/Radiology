@@ -150,28 +150,71 @@ export default function DicomViewer({
 
     loadImage(el);
 
+    // async function loadImage(element: HTMLDivElement) {
+    //   try {
+    //     setLoading(true);
+    //     setImageLoaded(false);
+
+    //     const currentFile = seriesFileList[safeIndex];
+    //     // The backend now serves DICOM bytes at /api/v1/studies/{id}/dicom/{filename}.
+    //     // Previously this pointed at /dicom/{id}/{...} which had no matching route
+    //     // anywhere (no FastAPI handler, no Nginx static block) — every fetch
+    //     // returned 404 and Cornerstone failed silently, leaving the viewer blank.
+    //     const imageUrl = `wadouri:/api/v1/studies/${studyId}/dicom/${encodeURIComponent(currentFile)}`;
+    //     const image = await window.cornerstone.loadImage(imageUrl);
+
+    //     // Guard: component may have unmounted during the async gap
+    //     if (!csEnabledRef.current) return;
+
+    //     window.cornerstone.displayImage(element, image);
+    //     setImageLoaded(true);
+    //     setError(null);
+    //   } catch (err) {
+    //     console.error("[DicomViewer] Failed to load image:", err);
+    //     setError(`Failed to load DICOM:\n${(err as Error).message}`);
+    //   } finally {
+    //     setLoading(false);
+    //   }
+    // }
     async function loadImage(element: HTMLDivElement) {
       try {
         setLoading(true);
         setImageLoaded(false);
 
         const currentFile = seriesFileList[safeIndex];
-        // The backend now serves DICOM bytes at /api/v1/studies/{id}/dicom/{filename}.
-        // Previously this pointed at /dicom/{id}/{...} which had no matching route
-        // anywhere (no FastAPI handler, no Nginx static block) — every fetch
-        // returned 404 and Cornerstone failed silently, leaving the viewer blank.
         const imageUrl = `wadouri:/api/v1/studies/${studyId}/dicom/${encodeURIComponent(currentFile)}`;
-        const image = await window.cornerstone.loadImage(imageUrl);
 
-        // Guard: component may have unmounted during the async gap
+        const image = await Promise.race([
+          window.cornerstone.loadImage(imageUrl),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error("Image load timed out")), 30000),
+          ),
+        ]);
+
         if (!csEnabledRef.current) return;
 
         window.cornerstone.displayImage(element, image);
+
+        // Apply DICOM W/L — without this, CT Hounsfield values render black
+        try {
+          const defaultVp = window.cornerstone.getDefaultViewportForImage(
+            element,
+            image,
+          );
+          if (defaultVp) {
+            window.cornerstone.setViewport(element, defaultVp);
+            window.cornerstone.updateImage(element);
+          }
+        } catch {
+          /* ignore */
+        }
+
         setImageLoaded(true);
         setError(null);
       } catch (err) {
         console.error("[DicomViewer] Failed to load image:", err);
-        setError(`Failed to load DICOM:\n${(err as Error).message}`);
+        const msg = err instanceof Error ? err.message : String(err);
+        setError(`Failed to load DICOM:\n${msg}`);
       } finally {
         setLoading(false);
       }

@@ -125,8 +125,10 @@ export default function UploadPage() {
     isSubmittingRef.current = true;
     setIsSubmitting(true);
     setUploadError("");
+    let wakeLock: any = null;
 
     try {
+      wakeLock = await (navigator as any).wakeLock?.request("screen");
       // 1. Create study record
       setUploadStage("Creating study record…");
       const study = await createStudy({
@@ -195,6 +197,7 @@ export default function UploadPage() {
     } finally {
       isSubmittingRef.current = false;
       setIsSubmitting(false);
+      try { await wakeLock?.release(); } catch {}
     }
   };
 
