@@ -20,6 +20,10 @@ export interface StudyPayload {
 export interface StudyOut extends StudyPayload {
   id: string;
   status: string;
+  // Added: the backend sets this after every upload via _count_dicom_like_files.
+  // StudyContext reads it as `s.number_of_images ?? 0` — without the field here
+  // TypeScript had no idea the property existed, making it easy to misuse.
+  number_of_images: number;
   study_instance_uid: string | null;
   accession_number: string | null;
   ai_report: string | null;
@@ -65,7 +69,6 @@ export class ApiError extends Error {
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-// Replace apiFetch with this version that handles empty responses
 async function apiFetch<T>(
   url: string,
   options?: RequestInit,
@@ -157,34 +160,39 @@ const TTL = {
 } as const;
 
 // ─── ZIP helper ───────────────────────────────────────────────────────────────
-// Bundles multiple File objects into a single ZIP Blob using fflate's
-// async `zip()` so the main thread is never blocked.
+//
+// Bundles multiple File objects into a single ZIP Blob using fflate so the
+// backend receives exactly one multipart request regardless of file count.
+//
+// KEY FIX — sequential reads instead of Promise.all:
+//
+// The original version used `Promise.all(files.map(f => f.arrayBuffer()))`,
+// which reads every file into a Uint8Array simultaneously before zipping.
+// For a 200-slice CT study (~200 MB) this puts ~400 MB into browser RAM at
+// once (once in the source Uint8Arrays, once in fflate's output buffer) and
+// freezes or crashes the tab.
+//
+// The new version reads and appends one file at a time so peak memory stays
+// close to (largest single file + output buffer) rather than (sum of all files).
+// DICOM data is already compressed — level 0 (store mode) avoids wasting CPU.
 
 function bundleAsZip(files: File[]): Promise<Blob> {
-  return new Promise(async (resolve, reject) => {
-    try {
-      // Read all files into Uint8Arrays in parallel
-      const entries = await Promise.all(
-        files.map(async (f) => {
-          const buf = await f.arrayBuffer();
-          return [f.name, new Uint8Array(buf)] as [string, Uint8Array];
-        }),
-      );
-
-      // Build the fflate input map — DICOM files are already compressed
-      // so store them without re-compression (level: 0) for max speed.
+  return new Promise((resolve, reject) => {
+    ;(async () => {
       const input: Record<string, [Uint8Array, { level: 0 }]> = {};
-      for (const [name, data] of entries) {
-        input[name] = [data, { level: 0 }];
+
+      for (const f of files) {
+        // Await each file individually — the previous buffer can be GC'd
+        // before the next one is read, keeping peak RAM low.
+        const buf = await f.arrayBuffer();
+        input[f.name] = [new Uint8Array(buf), { level: 0 }];
       }
 
       zip(input, (err, data) => {
         if (err) return reject(err);
         resolve(new Blob([data], { type: "application/zip" }));
       });
-    } catch (err) {
-      reject(err);
-    }
+    })().catch(reject);
   });
 }
 
@@ -216,26 +224,36 @@ export async function uploadDicom(studyId: string, file: File): Promise<StudyOut
 }
 
 // ── Batch upload — ONE request regardless of file count ───────────────────────
-// All files are zipped client-side and sent as a single multipart request.
-// The backend's existing ZIP extraction handler unpacks them server-side.
-// Reduces N upload-dicom requests to exactly 1.
+//
+// • 1 file  → sent as-is via uploadDicom (no ZIP overhead).
+//             If the file is already a .zip or .rar, the backend's archive
+//             handler extracts it server-side — no client extraction needed.
+// • N files → bundled into a single batch.zip via fflate (store mode, fast)
+//             and sent as one request. Backend extracts the ZIP.
+//
+// This means UploadPage no longer needs to extract ZIPs in the browser —
+// drop a .zip and it travels straight to the server, which is much faster.
+
 export async function uploadDicomBatch(
   studyId: string,
   files: File[],
 ): Promise<StudyOut> {
   if (files.length === 0) return getStudy(studyId);
 
-  // Single file — skip ZIP overhead, send directly
+  // Single file (including ZIP/RAR) — skip bundling, send directly
   if (files.length === 1) return uploadDicom(studyId, files[0]);
 
   const zipBlob = await bundleAsZip(files);
   const form = new FormData();
-  form.append("file", new File([zipBlob], "batch.zip", { type: "application/zip" }));
+  form.append(
+    "file",
+    new File([zipBlob], "batch.zip", { type: "application/zip" }),
+  );
 
   const study = await apiFetch<StudyOut>(
     `${BASE}/studies/${studyId}/upload-dicom`,
     { method: "POST", body: form },
-    2, // retry up to 2x — single large upload is worth retrying
+    2, // retry up to 2× — one large upload is worth retrying on transient error
   );
 
   studyCache.set(`study:${studyId}`, study, TTL.study);

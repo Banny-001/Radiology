@@ -4,7 +4,6 @@ import {
   AlertTriangle,
   ChevronDown,
   ChevronUp,
-  FileArchive,
   Files,
 } from "lucide-react";
 import PacsConnectionCard from "../Pacsconnectioncard";
@@ -46,8 +45,6 @@ export default function UploadPage() {
   const [uploadStage, setUploadStage] = useState<string>("");
   const [uploadError, setUploadError] = useState<string>("");
   const [filesExpanded, setFilesExpanded] = useState(true);
-  const [isExtractingZip, setIsExtractingZip] = useState(false);
-  const [extractionMsg, setExtractionMsg] = useState("");
 
   const isSubmittingRef = useRef(false);
   const formRef = useRef<HTMLDivElement>(null);
@@ -58,103 +55,52 @@ export default function UploadPage() {
     return () => window.removeEventListener("resize", handler);
   }, []);
 
-  // ── ZIP extraction ─────────────────────────────────────────────────────────
-  const extractZip = async (zipFile: File): Promise<File[]> => {
-    // Dynamic import keeps jszip out of the initial bundle
-    const { default: JSZip } = await import("jszip");
-    const zip = await new JSZip().loadAsync(zipFile);
-    const extracted: File[] = [];
-
-    for (const [path, entry] of Object.entries(zip.files)) {
-      if (entry.dir) continue;
-      const name = path.split("/").pop() ?? path;
-      // Skip macOS metadata and hidden entries
-      if (name.startsWith(".") || path.includes("__MACOSX")) continue;
-      const blob = await entry.async("blob");
-      extracted.push(new File([blob], name, { type: "application/dicom" }));
-    }
-    return extracted;
-  };
+  // ── Prevent accidental refresh / navigation during upload ──────────────────
+  // Without this, a refresh mid-upload creates an orphan study record with
+  // 0 images in the worklist — the upload page disappears but no success
+  // message is shown, and the DICOM viewer finds nothing to display.
+  useEffect(() => {
+    const handler = (e: BeforeUnloadEvent) => {
+      if (isSubmitting) {
+        e.preventDefault();
+        // Setting returnValue triggers the browser's built-in "Leave site?" dialog
+        e.returnValue = "";
+      }
+    };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, [isSubmitting]);
 
   // ── File handling ──────────────────────────────────────────────────────────
-  const addFiles = async (incoming: File[]) => {
-    const zips = incoming.filter((f) => f.name.toLowerCase().endsWith(".zip"));
-    let allFiles = incoming.filter(
-      (f) => !f.name.toLowerCase().endsWith(".zip"),
-    );
-
-    // ── Step 1: expand ZIPs ──────────────────────────────────────────────────
-    if (zips.length > 0) {
-      setIsExtractingZip(true);
-      setExtractionMsg(
-        zips.length === 1
-          ? `Extracting ${zips[0].name}…`
-          : `Extracting ${zips.length} ZIP archives…`,
-      );
-      try {
-        for (const zip of zips) {
-          const out = await extractZip(zip);
-          setExtractionMsg(
-            `✓  Extracted ${out.length} file${out.length !== 1 ? "s" : ""} from ${zip.name}`,
-          );
-          allFiles = [...allFiles, ...out];
-        }
-      } catch (err) {
-        console.error("ZIP extraction failed:", err);
-        setExtractionMsg("⚠  Extraction failed — check browser console");
-      } finally {
-        // Hold the banner briefly so the user can read the result
-        await new Promise<void>((r) => setTimeout(r, 800));
-        setIsExtractingZip(false);
-      }
-    }
-
-    // ── Step 2: deduplicate & queue ──────────────────────────────────────────
-    // Using a functional update so `prevRaw` is always the latest state,
-    // even if addFiles is called concurrently (e.g. multiple rapid drops).
+  // ZIP files are queued as-is and sent directly to the backend.
+  // Previously, ZIPs were extracted in the browser (slow, memory-intensive)
+  // and then re-bundled for upload — a double round-trip that made large
+  // studies take much longer than necessary.
+  //
+  // IMPORTANT: your backend's upload endpoint must accept .zip files and
+  // extract them server-side. If uploadDicomBatch currently re-bundles files
+  // into a ZIP before sending, update it to POST files via multipart FormData
+  // instead so ZIPs aren't double-wrapped.
+  const addFiles = (incoming: File[]) => {
     setRawFiles((prevRaw) => {
       const existingKeys = new Set(prevRaw.map(fileKey));
-      const fresh = allFiles.filter((f) => !existingKeys.has(fileKey(f)));
+      const fresh = incoming.filter((f) => !existingKeys.has(fileKey(f)));
       if (fresh.length === 0) return prevRaw;
 
       const startIdx = prevRaw.length;
       const totalAfter = startIdx + fresh.length;
 
-      // Auto-collapse so the form is reachable without scrolling
       if (totalAfter > AUTO_COLLAPSE_AT) setFilesExpanded(false);
 
       const mapped: UploadedFile[] = fresh.map((f) => ({
         name: f.name,
         size: formatSize(f.size),
-        progress: 0,
-        done: false,
+        // Files are ready immediately — no client-side scanning needed
+        progress: 100,
+        done: true,
       }));
 
       setFiles((pf) => [...pf, ...mapped]);
-
-      // Animate per-file scan progress
-      mapped.forEach((_, i) => {
-        const idx = startIdx + i;
-        let prog = 0;
-        const iv = setInterval(() => {
-          prog += Math.random() * 20 + 10;
-          if (prog >= 100) {
-            clearInterval(iv);
-            setFiles((pf) =>
-              pf.map((f, fi) =>
-                fi === idx ? { ...f, progress: 100, done: true } : f,
-              ),
-            );
-          } else {
-            setFiles((pf) =>
-              pf.map((f, fi) =>
-                fi === idx ? { ...f, progress: Math.round(prog) } : f,
-              ),
-            );
-          }
-        }, 300);
-      });
-
       return [...prevRaw, ...fresh];
     });
   };
@@ -201,30 +147,39 @@ export default function UploadPage() {
         is_urgent: form.urgent,
       });
 
-      // 2. Bundle all files into one ZIP and send a single request
+      // 2. Upload files (ZIPs sent directly — backend extracts them)
       if (rawFiles.length > 0) {
-        setUploadStage(
-          rawFiles.length === 1
-            ? "Uploading 1 DICOM file…"
-            : `Bundling ${rawFiles.length} DICOM files & uploading…`,
-        );
+        const zipCount = rawFiles.filter((f) =>
+          f.name.toLowerCase().endsWith(".zip"),
+        ).length;
+        const dicomCount = rawFiles.length - zipCount;
+
+        let stageMsg = "";
+        if (zipCount > 0 && dicomCount > 0) {
+          stageMsg = `Uploading ${zipCount} ZIP archive${zipCount !== 1 ? "s" : ""} and ${dicomCount} file${dicomCount !== 1 ? "s" : ""}…`;
+        } else if (zipCount > 0) {
+          stageMsg = `Uploading ${zipCount} ZIP archive${zipCount !== 1 ? "s" : ""}…`;
+        } else {
+          stageMsg = `Uploading ${dicomCount} DICOM file${dicomCount !== 1 ? "s" : ""}…`;
+        }
+        setUploadStage(stageMsg);
+
         try {
           await uploadDicomBatch(study.id, rawFiles);
         } catch (uploadErr) {
-          // File upload failed — delete the orphan study record immediately.
-          // Without this, a "pending / 0 images" row lingers in the worklist
-          // and the user thinks the upload completed when it didn't.
+          // File upload failed — delete the orphan study record immediately so
+          // a "pending / 0 images" row doesn't linger in the worklist.
           setUploadStage("Cleaning up…");
           try {
             await deleteStudy(study.id);
           } catch {
             /* best-effort */
           }
-          throw uploadErr; // re-throw → outer catch shows the error banner
+          throw uploadErr;
         }
       }
 
-      // 3. Await refresh BEFORE showing the modal so the worklist is already
+      // 3. Refresh worklist BEFORE showing the modal so the list is already
       //    current when the user clicks "View in Worklist".
       setUploadStage("Refreshing worklist…");
       await refresh();
@@ -267,14 +222,6 @@ export default function UploadPage() {
     );
   }
 
-  // ── Derived values ─────────────────────────────────────────────────────────
-  const doneCount = files.filter((f) => f.done).length;
-  const overallPct =
-    files.length === 0
-      ? 0
-      : Math.round(
-          files.reduce((sum, f) => sum + f.progress, 0) / files.length,
-        );
   const hasFiles = files.length > 0;
   const pad = isMobile ? "16px" : "32px";
 
@@ -287,8 +234,85 @@ export default function UploadPage() {
         boxSizing: "border-box",
       }}
     >
-      {/* Single keyframes definition shared by all spinners */}
       <style>{`@keyframes spin { from { transform:rotate(0deg) } to { transform:rotate(360deg) } }`}</style>
+
+      {/* ── Blocking upload overlay ──────────────────────────────────────────
+           A full-screen modal rather than an inline banner. This makes it
+           impossible to accidentally click away or refresh while uploading,
+           and gives the user clear feedback without them having to scroll
+           back up to find the status banner.                                  */}
+      {isSubmitting && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 999,
+            background: "rgba(0,0,0,0.5)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: "20px",
+          }}
+        >
+          <div
+            style={{
+              background: "#fff",
+              borderRadius: "20px",
+              padding: "36px 28px",
+              maxWidth: "340px",
+              width: "100%",
+              textAlign: "center",
+              boxShadow: "0 20px 60px rgba(0,0,0,0.25)",
+            }}
+          >
+            {/* Spinner */}
+            <div
+              style={{
+                width: "52px",
+                height: "52px",
+                border: "4px solid #fed7aa",
+                borderTopColor: "#EA580C",
+                borderRadius: "50%",
+                animation: "spin 0.8s linear infinite",
+                margin: "0 auto 20px",
+              }}
+            />
+            <div
+              style={{
+                fontWeight: 700,
+                fontSize: "18px",
+                color: "#111827",
+                marginBottom: "8px",
+              }}
+            >
+              Uploading Study
+            </div>
+            <div
+              style={{
+                fontSize: "13px",
+                color: "#6b7280",
+                marginBottom: "20px",
+                minHeight: "20px",
+              }}
+            >
+              {uploadStage}
+            </div>
+            <div
+              style={{
+                background: "#FFF7ED",
+                border: "1px solid #fed7aa",
+                borderRadius: "10px",
+                padding: "10px 14px",
+                fontSize: "12px",
+                color: "#9a3412",
+                fontWeight: 500,
+              }}
+            >
+              Don't close or refresh this tab
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Header ──────────────────────────────────────────────────────────── */}
       <div style={{ marginBottom: "24px" }}>
@@ -332,58 +356,6 @@ export default function UploadPage() {
           immediately.
         </div>
       </div>
-
-      {/* ── ZIP extraction banner ────────────────────────────────────────────── */}
-      {isExtractingZip && (
-        <div
-          style={{
-            background: "#F0FDF4",
-            border: "1px solid #bbf7d0",
-            borderRadius: "12px",
-            padding: "14px 16px",
-            marginBottom: "24px",
-            display: "flex",
-            alignItems: "center",
-            gap: "10px",
-          }}
-        >
-          <FileArchive size={16} color="#16a34a" style={{ flexShrink: 0 }} />
-          <span style={{ fontSize: "13px", color: "#166534", fontWeight: 600 }}>
-            {extractionMsg}
-          </span>
-        </div>
-      )}
-
-      {/* ── Upload in-progress banner ────────────────────────────────────────── */}
-      {isSubmitting && (
-        <div
-          style={{
-            background: "#FFF7ED",
-            border: "1px solid #fed7aa",
-            borderRadius: "12px",
-            padding: "14px 16px",
-            marginBottom: "24px",
-            display: "flex",
-            alignItems: "center",
-            gap: "10px",
-          }}
-        >
-          <div
-            style={{
-              width: "16px",
-              height: "16px",
-              border: "2px solid #fed7aa",
-              borderTopColor: "#EA580C",
-              borderRadius: "50%",
-              animation: "spin 0.8s linear infinite",
-              flexShrink: 0,
-            }}
-          />
-          <span style={{ fontSize: "13px", color: "#9a3412", fontWeight: 600 }}>
-            {uploadStage}
-          </span>
-        </div>
-      )}
 
       {/* ── Upload error banner ──────────────────────────────────────────────── */}
       {uploadError && (
@@ -437,7 +409,6 @@ export default function UploadPage() {
                   userSelect: "none",
                 }}
               >
-                {/* Left: file count + scan status */}
                 <div
                   style={{ display: "flex", alignItems: "center", gap: "8px" }}
                 >
@@ -449,50 +420,12 @@ export default function UploadPage() {
                       color: "#374151",
                     }}
                   >
-                    {files.length} file{files.length !== 1 ? "s" : ""}
-                    {" · "}
-                    {doneCount < files.length
-                      ? `scanning (${doneCount} / ${files.length})`
-                      : "all ready"}
+                    {files.length} file{files.length !== 1 ? "s" : ""} · ready
                   </span>
                 </div>
-
-                {/* Right: mini progress bar when collapsed + chevron */}
                 <div
                   style={{ display: "flex", alignItems: "center", gap: "10px" }}
                 >
-                  {!filesExpanded && (
-                    <>
-                      <div
-                        style={{
-                          width: "72px",
-                          height: "4px",
-                          background: "#f3f4f6",
-                          borderRadius: "2px",
-                        }}
-                      >
-                        <div
-                          style={{
-                            width: `${overallPct}%`,
-                            height: "100%",
-                            background: "#1A73E8",
-                            borderRadius: "2px",
-                            transition: "width 0.3s",
-                          }}
-                        />
-                      </div>
-                      <span
-                        style={{
-                          fontSize: "11px",
-                          color: "#6b7280",
-                          minWidth: "28px",
-                          textAlign: "right",
-                        }}
-                      >
-                        {overallPct}%
-                      </span>
-                    </>
-                  )}
                   {filesExpanded ? (
                     <ChevronUp size={15} color="#6b7280" />
                   ) : (
@@ -532,7 +465,6 @@ export default function UploadPage() {
             )}
           </div>
 
-          {/* ── Jump-to-form shortcut ────────────────────────────────────────── */}
           {hasFiles && (
             <button
               onClick={() =>

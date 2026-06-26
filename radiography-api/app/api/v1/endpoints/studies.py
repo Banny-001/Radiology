@@ -287,9 +287,24 @@ async def delete_study(
     study_id: UUID,
     svc: StudyService = Depends(get_service),
 ):
+    # Capture dicom_path BEFORE deleting the row — once it's gone we can't look it up
+    study = await svc.get(study_id)
+    if not study:
+        raise HTTPException(status_code=404, detail="Study not found")
+
+    dicom_path = study.dicom_path
+
     deleted = await svc.delete(study_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Study not found")
+
+    # Remove files after the DB commit succeeds. ignore_errors=True means
+    # a missing folder (e.g. study with no uploads) never causes a 500.
+    if dicom_path and os.path.isdir(dicom_path):
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None, lambda: shutil.rmtree(dicom_path, ignore_errors=True)
+        )
 
 
 @router.post("/{study_id}/upload-dicom", response_model=StudyOut)

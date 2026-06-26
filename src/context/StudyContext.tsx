@@ -1,4 +1,4 @@
-import { createContext, useContext, useState, useEffect, useCallback } from 'react'
+import { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react'
 import type { ReactNode } from 'react'
 import type { Study, Comment } from '../types'
 import { listStudies, updateStudy } from '../services/studyService'
@@ -28,7 +28,10 @@ function mapApiStudy(s: any): Study {
     modality: s.modality,
     description: s.description,
     bodyPart: s.description,
-    numberOfImages: s.dicom_path ? 1 : 0,
+    // ── FIX: was `s.dicom_path ? 1 : 0` which always showed "1 image" for
+    //    any study that had a dicom_path, and "0" for everything else.
+    //    The API returns the real count in `number_of_images` — use that.
+    numberOfImages: s.number_of_images ?? 0,
     referringDoctor: s.referring_doctor ?? '—',
     assignedRadiologist: null,
     institution: s.institution ?? '',
@@ -45,17 +48,27 @@ function mapApiStudy(s: any): Study {
     dicom_path: s.dicom_path ?? null,
   }
 }
-export function StudyProvider({ children }: { children: ReactNode }) {
-  const [studies, setStudies] = useState<Study[]>([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
 
-  const fetchStudies = useCallback(async () => {
-    setLoading(true)
+export function StudyProvider({ children }: { children: ReactNode }) {
+  const [studies, setStudies]   = useState<Study[]>([])
+  const [loading, setLoading]   = useState(true)
+  const [error, setError]       = useState<string | null>(null)
+
+  // Track whether an initial load has ever completed so background refreshes
+  // don't flash the loading spinner — they update silently.
+  const initialLoadDone = useRef(false)
+
+  const fetchStudies = useCallback(async (background = false) => {
+    // First load shows the spinner; subsequent refreshes update silently
+    // so the worklist doesn't flicker while the upload completes.
+    if (!background || !initialLoadDone.current) {
+      setLoading(true)
+    }
     setError(null)
     try {
       const data = await listStudies({ page_size: 100 })
       setStudies(data.items.map(mapApiStudy))
+      initialLoadDone.current = true
     } catch (err: any) {
       setError(err.message ?? 'Failed to fetch studies')
     } finally {
@@ -65,6 +78,12 @@ export function StudyProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     fetchStudies()
+  }, [fetchStudies])
+
+  // `refresh` is called externally (e.g. after upload) — run as background
+  // so the worklist updates without flashing a full loading state.
+  const refresh = useCallback(() => {
+    fetchStudies(/* background */ true)
   }, [fetchStudies])
 
   const addComment = (studyId: string, comment: Omit<Comment, 'id'>) => {
@@ -81,7 +100,6 @@ export function StudyProvider({ children }: { children: ReactNode }) {
     // Optimistic update
     setStudies(prev => prev.map(s => (s.id === studyId ? { ...s, status } : s)))
 
-    // Map frontend status → API status
     const apiStatus = status === 'UNREAD'      ? 'pending'
                     : status === 'IN_PROGRESS'  ? 'in_progress'
                     : status === 'REPORTED'      ? 'reported'
@@ -90,12 +108,12 @@ export function StudyProvider({ children }: { children: ReactNode }) {
       await updateStudy(studyId, { status: apiStatus })
     } catch (err) {
       console.error('Failed to update status:', err)
-      fetchStudies() // revert by re-fetching
+      fetchStudies(true) // revert by re-fetching (silent — no loading flash)
     }
   }
 
   return (
-    <StudyContext.Provider value={{ studies, loading, error, refresh: fetchStudies, addComment, updateStudyStatus }}>
+    <StudyContext.Provider value={{ studies, loading, error, refresh, addComment, updateStudyStatus }}>
       {children}
     </StudyContext.Provider>
   )
