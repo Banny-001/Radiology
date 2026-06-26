@@ -300,13 +300,13 @@ export default function DicomViewer({
     };
 
     // ── touchend ────────────────────────────────────────────────────────────
+
     const onEnd = (e: TouchEvent) => {
       e.preventDefault();
 
       if (isPinching) {
         isPinching = false;
         pinchDist = null;
-        // No swipe interpretation at the end of a pinch
       } else if (
         e.changedTouches.length === 1 &&
         touchStartX !== null &&
@@ -314,13 +314,10 @@ export default function DicomViewer({
       ) {
         const dx = e.changedTouches[0].clientX - touchStartX;
         const dy = e.changedTouches[0].clientY - touchStartY;
-
-        // Swipe: clearly more vertical than horizontal, and at least 30 px
         const isSliceSwipe =
           Math.abs(dy) > 30 && Math.abs(dy) > Math.abs(dx) * 1.5;
 
         if (isSliceSwipe && seriesFileListRef.current.length > 1) {
-          // Swipe up (dy < 0) → advance to next slice; swipe down → previous
           const direction = dy < 0 ? 1 : -1;
           const next = Math.max(
             0,
@@ -331,6 +328,22 @@ export default function DicomViewer({
           );
           setLocalIndex(next);
           onImageIndexChangeRef.current?.(next);
+        } else if (Math.abs(dx) < 10 && Math.abs(dy) < 10) {
+          // It's a tap — dispatch a click so measurement tool handlers
+          // in ViewerPage's handleViewportClick fire correctly.
+          // The click bubbles up to the outer viewport div where onClick
+          // is attached; clientX/Y are used for getBoundingClientRect subtraction.
+          el.dispatchEvent(
+            new MouseEvent("click", {
+              bubbles: true,
+              cancelable: true,
+              view: window,
+              button: 0,
+              buttons: 0,
+              clientX: e.changedTouches[0].clientX,
+              clientY: e.changedTouches[0].clientY,
+            }),
+          );
         }
       }
 
