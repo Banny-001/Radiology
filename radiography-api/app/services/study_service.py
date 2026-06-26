@@ -64,4 +64,5 @@ class StudyService:
         if not study:
             return False
         await self.db.delete(study)
+        await self.db.flush()
         return True

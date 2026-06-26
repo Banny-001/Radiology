@@ -1,3 +1,4 @@
+import asyncio
 import io
 import os
 import shutil
@@ -10,6 +11,7 @@ from uuid import UUID, uuid4
 import aiofiles
 import numpy as np
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi.responses import FileResponse
 from PIL import Image
 from pydicom import dcmread
 from pydicom.dataset import Dataset, FileDataset
@@ -28,6 +30,8 @@ IMAGE_CONTENT_TYPES = {"image/jpeg", "image/png", "image/jpg"}
 ARCHIVE_EXTENSIONS = {".zip", ".rar"}
 DICOM_LIKE_EXTENSIONS = {"", ".dcm", ".dicom", ".dicomdir"}
 
+_UPLOAD_CHUNK = 1024 * 1024   # 1 MB – stream uploads in this chunk size
+
 
 def get_service(db: AsyncSession = Depends(get_db)) -> StudyService:
     return StudyService(db)
@@ -36,9 +40,6 @@ def get_service(db: AsyncSession = Depends(get_db)) -> StudyService:
 # ── Storage helpers ────────────────────────────────────────────────────────
 
 def _study_folder(study_id: UUID) -> str:
-    """Every study gets its own folder, named after its UUID. dicom_path
-    stores this folder, not a single file — the viewer derives the study_id
-    back out of dicom_path by taking the last path segment."""
     folder = os.path.join(settings.DICOM_STORAGE_PATH, str(study_id))
     os.makedirs(folder, exist_ok=True)
     return folder
@@ -52,12 +53,7 @@ def _is_image_file(filename: str, content_type: str | None = None) -> bool:
 
 
 def _looks_like_dicom(data: bytes) -> bool:
-    """Best-effort check that raw bytes are an actual DICOM dataset, not
-    just something that happens to have a DICOM-like extension (or no
-    extension at all). Conformant DICOM files have a 128-byte preamble
-    followed by the 'DICM' magic — check that first since it's cheap and
-    exact. Some legacy/non-conformant exports omit the preamble, so fall
-    back to a full pydicom parse attempt before giving up."""
+    """Fast DICOM magic check first, full parse fallback."""
     if len(data) > 132 and data[128:132] == b"DICM":
         return True
     try:
@@ -67,9 +63,21 @@ def _looks_like_dicom(data: bytes) -> bool:
         return False
 
 
+def _looks_like_dicom_path(path: str) -> bool:
+    """Read just the header from disk — avoids loading full pixel data."""
+    try:
+        with open(path, "rb") as f:
+            header = f.read(132)
+        if len(header) > 132 and header[128:132] == b"DICM":
+            return True
+        # Non-conformant files: fall back to full parse
+        dcmread(path, force=False, stop_before_pixels=True)
+        return True
+    except Exception:
+        return False
+
+
 def _count_dicom_like_files(folder: str) -> int:
-    """number_of_images should reflect viewable DICOM instances, not every
-    attachment that might be sitting in the folder (e.g. a PDF report)."""
     count = 0
     for fname in os.listdir(folder):
         path = os.path.join(folder, fname)
@@ -84,10 +92,6 @@ def _count_dicom_like_files(folder: str) -> int:
 # ── Image → DICOM conversion ─────────────────────────────────────────────
 
 def _image_to_dicom_dataset(image: Image.Image, study) -> FileDataset:
-    """Wrap a plain JPEG/PNG image in a minimal DICOM dataset so it can be
-    rendered by dwv-style DICOM viewers. Simplified: 8-bit, single-frame,
-    Modality "OT" (Other) — there's no real acquisition metadata to recover
-    from a plain image."""
     if image.mode not in ("L", "RGB"):
         image = image.convert("RGB")
     pixel_array = np.array(image)
@@ -103,7 +107,6 @@ def _image_to_dicom_dataset(image: Image.Image, study) -> FileDataset:
     ds = FileDataset(None, {}, file_meta=file_meta, preamble=b"\x00" * 128)
     ds.is_little_endian = True
     ds.is_implicit_VR = False
-
     ds.SOPClassUID = file_meta.MediaStorageSOPClassUID
     ds.SOPInstanceUID = file_meta.MediaStorageSOPInstanceUID
     ds.StudyInstanceUID = generate_uid()
@@ -113,14 +116,12 @@ def _image_to_dicom_dataset(image: Image.Image, study) -> FileDataset:
     ds.StudyDate = now.strftime("%Y%m%d")
     ds.StudyTime = now.strftime("%H%M%S")
     ds.Modality = "OT"
-
     ds.PatientName = study.patient_name
     ds.PatientID = study.patient_id
     dob = getattr(study, "date_of_birth", None)
     if dob:
         ds.PatientBirthDate = dob.strftime("%Y%m%d") if hasattr(dob, "strftime") else str(dob).replace("-", "")
     ds.PatientSex = (study.sex or "")[:1].upper()
-
     ds.Rows = rows
     ds.Columns = cols
     ds.SamplesPerPixel = 3 if is_color else 1
@@ -132,7 +133,6 @@ def _image_to_dicom_dataset(image: Image.Image, study) -> FileDataset:
     ds.HighBit = 7
     ds.PixelRepresentation = 0
     ds.NumberOfFrames = 1
-
     ds.PixelData = pixel_array.tobytes()
     return ds
 
@@ -158,9 +158,6 @@ def _extract_archive(archive_path: str, extract_to: str, ext: str) -> None:
         with zipfile.ZipFile(archive_path) as zf:
             zf.extractall(extract_to)
     elif ext == ".rar":
-        # Requires the `unar` binary on the host (Homebrew no longer ships
-        # `unrar` — install via `brew install unar` on macOS, or
-        # `apt-get install unar` on Debian/Ubuntu).
         result = subprocess.run(
             ["unar", "-f", "-D", "-q", "-o", extract_to, archive_path],
             capture_output=True, text=True,
@@ -178,10 +175,6 @@ def _extract_archive(archive_path: str, extract_to: str, ext: str) -> None:
 
 
 def _ingest_extracted_files(extract_dir: str, dest_folder: str, study) -> int:
-    """Walk an extracted archive. Plain images get converted to DICOM,
-    DICOM-like files get copied as-is (after verifying they're actually
-    DICOM, not just named like one), anything else (readme, logs, etc.)
-    is silently skipped. Returns count of files written."""
     count = 0
     for root, _dirs, files in os.walk(extract_dir):
         for fname in files:
@@ -196,16 +189,9 @@ def _ingest_extracted_files(extract_dir: str, dest_folder: str, study) -> int:
                     _save_image_file_as_dicom(src, dest, study)
                     count += 1
                 except Exception:
-                    continue  # not actually a valid image — skip it
-            elif ext in DICOM_LIKE_EXTENSIONS:
-                try:
-                    with open(src, "rb") as f:
-                        data = f.read()
-                except OSError:
                     continue
-                if not _looks_like_dicom(data):
-                    # extension matched but the content isn't real DICOM
-                    # (e.g. a stray .csv/.txt with no extension) — skip it
+            elif ext in DICOM_LIKE_EXTENSIONS:
+                if not _looks_like_dicom_path(src):
                     continue
                 dest_name = fname or f"{uuid4().hex}.dcm"
                 dest = os.path.join(dest_folder, dest_name)
@@ -213,7 +199,6 @@ def _ingest_extracted_files(extract_dir: str, dest_folder: str, study) -> int:
                     dest = os.path.join(dest_folder, f"{uuid4().hex}_{dest_name}")
                 shutil.copy2(src, dest)
                 count += 1
-            # else: not DICOM, not an image — skip (e.g. README.txt, logs)
     return count
 
 
@@ -256,8 +241,7 @@ async def list_study_files(
     study_id: UUID,
     svc: StudyService = Depends(get_service),
 ):
-    """Returns the filenames inside this study's folder, sorted, so the
-    frontend viewer can build full URLs and load the whole series."""
+    """Returns sorted filenames so the viewer can build full WADO URLs."""
     study = await svc.get(study_id)
     if not study:
         raise HTTPException(status_code=404, detail="Study not found")
@@ -268,6 +252,45 @@ async def list_study_files(
         if os.path.isfile(os.path.join(study.dicom_path, f)) and not f.startswith("__tmp_")
     )
     return {"files": files}
+
+
+@router.get("/{study_id}/dicom/{filename}")
+async def serve_dicom_file(
+    study_id: UUID,
+    filename: str,
+    svc: StudyService = Depends(get_service),
+):
+    """Serve raw DICOM bytes for Cornerstone's WADO URI loader.
+
+    The viewer builds URLs like:
+        wadouri:/api/v1/studies/{studyId}/dicom/{filename}
+    Cornerstone strips the wadouri: prefix and fetches this endpoint.
+    """
+    study = await svc.get(study_id)
+    if not study:
+        raise HTTPException(status_code=404, detail="Study not found")
+    if not study.dicom_path or not os.path.isdir(study.dicom_path):
+        raise HTTPException(status_code=404, detail="No DICOM files for this study")
+
+    # Path-traversal guard
+    if not filename or "/" in filename or "\\" in filename or filename.startswith(".."):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    file_path = os.path.join(study.dicom_path, filename)
+
+    real_file = os.path.realpath(file_path)
+    real_root = os.path.realpath(study.dicom_path)
+    if not real_file.startswith(real_root + os.sep):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    if not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail=f"File '{filename}' not found")
+
+    return FileResponse(
+        file_path,
+        media_type="application/dicom",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
 
 
 @router.patch("/{study_id}", response_model=StudyOut)
@@ -287,7 +310,9 @@ async def delete_study(
     study_id: UUID,
     svc: StudyService = Depends(get_service),
 ):
-    # Capture dicom_path BEFORE deleting the row — once it's gone we can't look it up
+    # Capture dicom_path BEFORE deleting the DB row — once the row is gone
+    # we can't look it up. Without this, every deletion leaves the DICOM
+    # folder on disk and storage fills up over time.
     study = await svc.get(study_id)
     if not study:
         raise HTTPException(status_code=404, detail="Study not found")
@@ -298,8 +323,8 @@ async def delete_study(
     if not deleted:
         raise HTTPException(status_code=404, detail="Study not found")
 
-    # Remove files after the DB commit succeeds. ignore_errors=True means
-    # a missing folder (e.g. study with no uploads) never causes a 500.
+    # Remove files after the DB commit succeeds.
+    # ignore_errors=True so a missing folder never causes a 500.
     if dicom_path and os.path.isdir(dicom_path):
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(
@@ -320,36 +345,45 @@ async def upload_dicom(
     dest_folder = _study_folder(study_id)
     original_name = file.filename or "upload"
     ext = os.path.splitext(original_name)[1].lower()
-    content = await file.read()
+    loop = asyncio.get_event_loop()
 
     if ext in ARCHIVE_EXTENSIONS:
         with tempfile.TemporaryDirectory() as tmp:
             archive_path = os.path.join(tmp, original_name)
+
             async with aiofiles.open(archive_path, "wb") as f:
-                await f.write(content)
+                while True:
+                    chunk = await file.read(_UPLOAD_CHUNK)
+                    if not chunk:
+                        break
+                    await f.write(chunk)
 
             extract_dir = os.path.join(tmp, "extracted")
             os.makedirs(extract_dir, exist_ok=True)
-            _extract_archive(archive_path, extract_dir, ext)
-            added = _ingest_extracted_files(extract_dir, dest_folder, study)
+
+            await loop.run_in_executor(
+                None, _extract_archive, archive_path, extract_dir, ext,
+            )
+            added: int = await loop.run_in_executor(
+                None, _ingest_extracted_files, extract_dir, dest_folder, study,
+            )
 
         if added == 0:
-            raise HTTPException(status_code=400, detail="Archive contained no DICOM or image files")
+            raise HTTPException(
+                status_code=400, detail="Archive contained no DICOM or image files",
+            )
 
     elif _is_image_file(original_name, file.content_type):
+        content = await file.read()
         dest = os.path.join(dest_folder, f"{uuid4().hex}.dcm")
         try:
-            _save_image_bytes_as_dicom(content, dest, study)
+            await loop.run_in_executor(
+                None, _save_image_bytes_as_dicom, content, dest, study,
+            )
         except Exception:
             raise HTTPException(status_code=400, detail="Uploaded file is not a valid image")
 
     else:
-        # Catch-all branch: previously this wrote *any* file straight into
-        # the study's DICOM folder with no validation at all, so something
-        # like a stray .csv/.xls would end up sitting alongside (or instead
-        # of) real DICOM data and silently break the viewer. Now we reject
-        # anything that isn't both DICOM-like by extension *and* verified
-        # as an actual DICOM dataset by content.
         if ext not in DICOM_LIKE_EXTENSIONS:
             raise HTTPException(
                 status_code=400,
@@ -358,18 +392,26 @@ async def upload_dicom(
                     "Expected a DICOM file, image (.jpg/.png), or .zip/.rar archive."
                 ),
             )
-        if not _looks_like_dicom(content):
+
+        dest_name = original_name or f"{uuid4().hex}.dcm"
+        if os.path.exists(os.path.join(dest_folder, dest_name)):
+            dest_name = f"{uuid4().hex}_{dest_name}"
+        dest = os.path.join(dest_folder, dest_name)
+
+        async with aiofiles.open(dest, "wb") as f:
+            while True:
+                chunk = await file.read(_UPLOAD_CHUNK)
+                if not chunk:
+                    break
+                await f.write(chunk)
+
+        is_dcm: bool = await loop.run_in_executor(None, _looks_like_dicom_path, dest)
+        if not is_dcm:
+            os.remove(dest)
             raise HTTPException(
                 status_code=400,
                 detail="Uploaded file does not appear to be a valid DICOM dataset.",
             )
-
-        dest_name = original_name
-        if os.path.exists(os.path.join(dest_folder, dest_name)):
-            dest_name = f"{uuid4().hex}_{original_name}"
-        dest = os.path.join(dest_folder, dest_name)
-        async with aiofiles.open(dest, "wb") as f:
-            await f.write(content)
 
     return await svc.update(study_id, StudyUpdate(
         dicom_path=dest_folder,
