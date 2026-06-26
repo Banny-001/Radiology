@@ -234,32 +234,69 @@ export async function uploadDicom(studyId: string, file: File): Promise<StudyOut
 // This means UploadPage no longer needs to extract ZIPs in the browser —
 // drop a .zip and it travels straight to the server, which is much faster.
 
+// export async function uploadDicomBatch(
+//   studyId: string,
+//   files: File[],
+// ): Promise<StudyOut> {
+//   if (files.length === 0) return getStudy(studyId);
+
+//   // Single file (including ZIP/RAR) — skip bundling, send directly
+//   if (files.length === 1) return uploadDicom(studyId, files[0]);
+
+//   const zipBlob = await bundleAsZip(files);
+//   const form = new FormData();
+//   form.append(
+//     "file",
+//     new File([zipBlob], "batch.zip", { type: "application/zip" }),
+//   );
+
+//   const study = await apiFetch<StudyOut>(
+//     `${BASE}/studies/${studyId}/upload-dicom`,
+//     { method: "POST", body: form },
+//     2, // retry up to 2× — one large upload is worth retrying on transient error
+//   );
+
+//   studyCache.set(`study:${studyId}`, study, TTL.study);
+//   fileListCache.delete(`files:${studyId}`);
+//   studyListCache.invalidatePrefix("studies:");
+//   return study;
+// }
+const BATCH_SIZE = 100;
+
 export async function uploadDicomBatch(
   studyId: string,
   files: File[],
+  onProgress?: (done: number, total: number) => void,
 ): Promise<StudyOut> {
   if (files.length === 0) return getStudy(studyId);
-
-  // Single file (including ZIP/RAR) — skip bundling, send directly
   if (files.length === 1) return uploadDicom(studyId, files[0]);
 
-  const zipBlob = await bundleAsZip(files);
-  const form = new FormData();
-  form.append(
-    "file",
-    new File([zipBlob], "batch.zip", { type: "application/zip" }),
-  );
+  // Split into chunks so we never ZIP thousands of files at once in the browser
+  const batches: File[][] = [];
+  for (let i = 0; i < files.length; i += BATCH_SIZE) {
+    batches.push(files.slice(i, i + BATCH_SIZE));
+  }
 
-  const study = await apiFetch<StudyOut>(
-    `${BASE}/studies/${studyId}/upload-dicom`,
-    { method: "POST", body: form },
-    2, // retry up to 2× — one large upload is worth retrying on transient error
-  );
+  let done = 0;
+  let lastResult: StudyOut | undefined;
 
-  studyCache.set(`study:${studyId}`, study, TTL.study);
+  for (const batch of batches) {
+    const zipBlob = await bundleAsZip(batch);
+    const form = new FormData();
+    form.append("file", new File([zipBlob], "batch.zip", { type: "application/zip" }));
+    lastResult = await apiFetch<StudyOut>(
+      `${BASE}/studies/${studyId}/upload-dicom`,
+      { method: "POST", body: form },
+      2,
+    );
+    done += batch.length;
+    onProgress?.(done, files.length);
+  }
+
+  studyCache.set(`study:${studyId}`, lastResult!, TTL.study);
   fileListCache.delete(`files:${studyId}`);
   studyListCache.invalidatePrefix("studies:");
-  return study;
+  return lastResult!;
 }
 
 export async function updateStudy(

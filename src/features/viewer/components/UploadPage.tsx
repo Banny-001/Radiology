@@ -1,11 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
-import {
-  AlertTriangle,
-  ChevronDown,
-  ChevronUp,
-  Files,
-} from "lucide-react";
+import { AlertTriangle, ChevronDown, ChevronUp, Files } from "lucide-react";
 import PacsConnectionCard from "../Pacsconnectioncard";
 import { type UploadedFile, type PatientForm, EMPTY_FORM } from "../types";
 import AutoArrivalGuide from "./Autoarrivalguide";
@@ -165,7 +160,10 @@ export default function UploadPage() {
         setUploadStage(stageMsg);
 
         try {
-          await uploadDicomBatch(study.id, rawFiles);
+          // await uploadDicomBatch(study.id, rawFiles);
+          await uploadDicomBatch(study.id, rawFiles, (done, total) => {
+            setUploadStage(`Uploading files… ${done} of ${total}`);
+          });
         } catch (uploadErr) {
           // File upload failed — delete the orphan study record immediately so
           // a "pending / 0 images" row doesn't linger in the worklist.
