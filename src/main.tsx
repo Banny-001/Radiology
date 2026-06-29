@@ -20,6 +20,16 @@ cornerstoneWADOImageLoader.configure({
     convertFloatPixelDataToInt: false,
   },
 });
+cornerstoneWADOImageLoader.webWorkerManager.initialize({
+  maxWebWorkers: Math.min(navigator.hardwareConcurrency || 4, 6),
+  startWebWorkersOnDemand: true,
+  taskConfiguration: {
+    decodeTask: {
+      initializeCodecsOnStartup: true,
+      usePDFJS: false,
+    },
+  },
+});
 
 // Register the loader for http/https URLs (our relative /dicom/ paths become absolute http URLs)
 const webImageLoader = cornerstoneWADOImageLoader.wadouri.loadImage;

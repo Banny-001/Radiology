@@ -150,32 +150,6 @@ export default function DicomViewer({
 
     loadImage(el);
 
-    // async function loadImage(element: HTMLDivElement) {
-    //   try {
-    //     setLoading(true);
-    //     setImageLoaded(false);
-
-    //     const currentFile = seriesFileList[safeIndex];
-    //     // The backend now serves DICOM bytes at /api/v1/studies/{id}/dicom/{filename}.
-    //     // Previously this pointed at /dicom/{id}/{...} which had no matching route
-    //     // anywhere (no FastAPI handler, no Nginx static block) — every fetch
-    //     // returned 404 and Cornerstone failed silently, leaving the viewer blank.
-    //     const imageUrl = `wadouri:/api/v1/studies/${studyId}/dicom/${encodeURIComponent(currentFile)}`;
-    //     const image = await window.cornerstone.loadImage(imageUrl);
-
-    //     // Guard: component may have unmounted during the async gap
-    //     if (!csEnabledRef.current) return;
-
-    //     window.cornerstone.displayImage(element, image);
-    //     setImageLoaded(true);
-    //     setError(null);
-    //   } catch (err) {
-    //     console.error("[DicomViewer] Failed to load image:", err);
-    //     setError(`Failed to load DICOM:\n${(err as Error).message}`);
-    //   } finally {
-    //     setLoading(false);
-    //   }
-    // }
     async function loadImage(element: HTMLDivElement) {
       try {
         setLoading(true);
@@ -220,6 +194,54 @@ export default function DicomViewer({
       }
     }
   }, [safeIndex, seriesFileList, studyId]);
+
+  // ── Background prefetch ───────────────────────────────────────────────────
+  //
+  // Fires once after the first image is displayed. Loads all remaining slices
+  // into Cornerstone's cache in the background so scrolling feels instant.
+  //
+  // Slices nearest the current index are fetched first so nearby navigation
+  // is responsive even before the full series is cached.
+  //
+  // Uses loadAndCacheImage (not displayImage) so nothing on screen changes —
+  // the user sees their current slice while the rest quietly pre-loads.
+  useEffect(() => {
+    if (!imageLoaded || seriesFileList.length <= 1) return;
+
+    let cancelled = false;
+
+    const backgroundPrefetch = async () => {
+      // Sort all other indices by proximity to current — nearest first
+      const indices = seriesFileList
+        .map((_, i) => i)
+        .filter((i) => i !== safeIndex)
+        .sort((a, b) => Math.abs(a - safeIndex) - Math.abs(b - safeIndex));
+
+      // Load in batches of 5 — enough to saturate HTTP/2 without overwhelming
+      // a slower connection or blocking the main thread
+      const BATCH = 5;
+      for (let i = 0; i < indices.length; i += BATCH) {
+        if (cancelled) break;
+        const batch = indices.slice(i, i + BATCH);
+        await Promise.all(
+          batch.map((idx) => {
+            const url = `wadouri:/api/v1/studies/${studyId}/dicom/${encodeURIComponent(seriesFileList[idx])}`;
+            // loadAndCacheImage fetches + decodes into cache without displaying
+            return window.cornerstone.loadAndCacheImage(url).catch(() => {});
+          }),
+        );
+        // Yield to the main thread between batches so UI stays responsive
+        await new Promise((r) => setTimeout(r, 30));
+      }
+    };
+
+    backgroundPrefetch();
+    return () => {
+      cancelled = true;
+    };
+  }, [imageLoaded, studyId]); // eslint-disable-line react-hooks/exhaustive-deps
+  // ↑ intentionally omits seriesFileList/safeIndex — we only want this to fire
+  //   once after the first image loads, not re-run on every slice change
 
   // ── Apply viewport transformations ────────────────────────────────────────
   //
@@ -343,7 +365,6 @@ export default function DicomViewer({
     };
 
     // ── touchend ────────────────────────────────────────────────────────────
-
     const onEnd = (e: TouchEvent) => {
       e.preventDefault();
 
