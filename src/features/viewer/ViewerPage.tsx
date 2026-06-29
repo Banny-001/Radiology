@@ -68,10 +68,16 @@ export default function ViewerPage() {
   const [isInverted, setIsInverted] = useState(false);
   const [isCinePlaying, setIsCinePlaying] = useState(false);
   const [isMprMode, setIsMprMode] = useState(false);
+
+  // ── MPR active panel (0=top-left/Axial, 1=top-right/Coronal,
+  //    2=bottom-left/Sagittal, 3=bottom-right/Active)
+  //    The active panel is interactive and tracks currentSlice.
+  //    Clicking any panel makes it active.
+  const [activeMprPanel, setActiveMprPanel] = useState(3);
+
   const cineIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Real DICOM file count reported back by DicomViewer.
-  // While 0, we fall back to the SERIES_MAP placeholder count.
   const [dicomFileCount, setDicomFileCount] = useState(0);
 
   // ── Measurement state ──────────────────────────────────────────────────
@@ -87,8 +93,6 @@ export default function ViewerPage() {
   const zoomRef = useRef(zoom);
   zoomRef.current = zoom;
 
-  // Compute maxSlices early for the touch ref. Prefer real DICOM count when
-  // available; otherwise use the placeholder series count.
   const placeholderMaxSlices = study
     ? ((SERIES_MAP[study.modality] ?? SERIES_MAP.CT)[activeSeries]?.count ?? 1)
     : 1;
@@ -115,8 +119,6 @@ export default function ViewerPage() {
     };
 
     const onWheelNative = (e: WheelEvent) => {
-      // Wheel always scrolls slices (most natural in a viewer),
-      // unless the zoom tool is explicitly selected.
       if (activeToolRef.current === "zoom") {
         e.preventDefault();
         setZoom((z) => Math.min(3, Math.max(0.3, z - e.deltaY * 0.001)));
@@ -205,7 +207,6 @@ export default function ViewerPage() {
     commentEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [study?.comments.length]);
 
-  // Cine playback — auto-advances currentSlice, which now drives DicomViewer
   useEffect(() => {
     if (isCinePlaying) {
       cineIntervalRef.current = setInterval(() => {
@@ -220,8 +221,6 @@ export default function ViewerPage() {
     };
   }, [isCinePlaying]);
 
-  // Keyboard navigation — arrows move through slices.
-  // Esc cancels in-progress measurement.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
@@ -265,7 +264,10 @@ export default function ViewerPage() {
     if (toolId === "flipv") setFlipV((f) => !f);
     if (toolId === "invert") setIsInverted((i) => !i);
     if (toolId === "cine") setIsCinePlaying((p) => !p);
-    if (toolId === "mpr") setIsMprMode((m) => !m);
+    if (toolId === "mpr") {
+      setIsMprMode((m) => !m);
+      setActiveMprPanel(3); // reset to bottom-right when toggling MPR
+    }
     if (toolId === "full") {
       if (!document.fullscreenElement) {
         document.documentElement.requestFullscreen?.().catch(() => {});
@@ -283,6 +285,7 @@ export default function ViewerPage() {
       setIsInverted(false);
       setIsCinePlaying(false);
       setIsMprMode(false);
+      setActiveMprPanel(3);
       setMeasurements([]);
       setPendingPoints([]);
       setHoverPoint(null);
@@ -325,7 +328,6 @@ export default function ViewerPage() {
 
   const series = SERIES_MAP[study.modality] ?? SERIES_MAP.CT;
   const currentSeries = series[activeSeries];
-  // Real DICOM file count wins over the placeholder count when available
   const maxSlices = dicomFileCount > 0 ? dicomFileCount : currentSeries.count;
 
   const TOOLS_PER_PAGE = isMobile ? 8 : TOOLS.length;
@@ -523,7 +525,7 @@ export default function ViewerPage() {
     </svg>
   );
 
-  // ── Single-panel viewport (used for both single view and inside MPR cells) ──
+  // ── Single-panel viewport ───────────────────────────────────────────────
   const renderSinglePanel = (
     w: string,
     h: string,
@@ -531,7 +533,7 @@ export default function ViewerPage() {
     label?: string,
   ) => {
     const sliceForPanel = sliceOverride ?? currentSlice;
-    const isReadOnly = sliceOverride !== undefined; // MPR sub-cells
+    const isReadOnly = sliceOverride !== undefined;
 
     const localPoint = (e: React.MouseEvent): Point => {
       const rect = e.currentTarget.getBoundingClientRect();
@@ -625,7 +627,7 @@ export default function ViewerPage() {
     const handleMouseUp = () => setIsDragging(false);
 
     const cursor = isReadOnly
-      ? "default"
+      ? "pointer"
       : isMeasurementTool(activeTool)
         ? "crosshair"
         : activeTool === "pan"
@@ -638,8 +640,6 @@ export default function ViewerPage() {
               ? "ns-resize"
               : "default";
 
-    // ── Inner image: DICOM goes through cornerstone (transforms applied
-    //    via viewport props); placeholder uses CSS transform on a child div.
     const scaleX = zoom * (flipH ? -1 : 1);
     const scaleY = zoom * (flipV ? -1 : 1);
     const placeholderTransform = `translate(${offset.x}px, ${offset.y}px) scale(${scaleX}, ${scaleY}) rotate(${rotation}deg)`;
@@ -649,7 +649,6 @@ export default function ViewerPage() {
         style={{
           width: "100%",
           height: "100%",
-          // CSS filter approximates W/L brightness over Cornerstone's canvas.
           filter: `brightness(${brightness}) ${isInverted ? "invert(1)" : ""}`,
         }}
       >
@@ -739,19 +738,19 @@ export default function ViewerPage() {
   const renderViewport = (w: string, h: string) => {
     if (!isMprMode) return renderSinglePanel(w, h);
 
-    // Quad layout — show 4 slice positions through the volume simultaneously.
-    // The bottom-right cell tracks the user's current slice (the "main" one).
     const total = maxSlices;
     const q1 = Math.max(1, Math.round(total * 0.25));
     const q2 = Math.max(1, Math.round(total * 0.5));
     const q3 = Math.max(1, Math.round(total * 0.75));
 
-    const cellStyle: React.CSSProperties = {
-      background: "#000",
-      border: "1px solid #1a1a1a",
-      overflow: "hidden",
-      position: "relative",
-    };
+    // Each panel has a label and a fixed reference slice shown when inactive.
+    // When a panel is active it shows currentSlice and accepts user input.
+    const panels = [
+      { label: "Axial",    fixedSlice: q1 },
+      { label: "Coronal",  fixedSlice: q2 },
+      { label: "Sagittal", fixedSlice: q3 },
+      { label: "Active",   fixedSlice: currentSlice },
+    ];
 
     return (
       <div
@@ -765,23 +764,47 @@ export default function ViewerPage() {
           background: "#1a1a1a",
         }}
       >
-        <div style={cellStyle}>
-          {renderSinglePanel("100%", "100%", q1, `Axial · ${q1}/${total}`)}
-        </div>
-        <div style={cellStyle}>
-          {renderSinglePanel("100%", "100%", q2, `Coronal · ${q2}/${total}`)}
-        </div>
-        <div style={cellStyle}>
-          {renderSinglePanel("100%", "100%", q3, `Sagittal · ${q3}/${total}`)}
-        </div>
-        <div style={{ ...cellStyle, borderColor: "#1A73E8" }}>
-          {renderSinglePanel(
-            "100%",
-            "100%",
-            currentSlice,
-            `Active · ${currentSlice}/${total}`,
-          )}
-        </div>
+        {panels.map((panel, i) => {
+          const isActive = activeMprPanel === i;
+          // Active panel is interactive (no sliceOverride), others are read-only
+          const sliceArg = isActive ? undefined : panel.fixedSlice;
+          const displaySlice = isActive ? currentSlice : panel.fixedSlice;
+          const panelLabel = `${panel.label} · ${displaySlice}/${total}`;
+
+          return (
+            <div
+              key={i}
+              onClick={() => setActiveMprPanel(i)}
+              style={{
+                background: "#000",
+                border: `2px solid ${isActive ? "#1A73E8" : "#333"}`,
+                overflow: "hidden",
+                position: "relative",
+                // Pointer on the wrapper so tapping it feels clickable on mobile
+                cursor: isActive ? "default" : "pointer",
+                boxSizing: "border-box",
+              }}
+            >
+              {renderSinglePanel("100%", "100%", sliceArg, panelLabel)}
+              {/* "Tap to activate" hint on inactive panels (mobile-friendly) */}
+              {!isActive && (
+                <div
+                  style={{
+                    position: "absolute",
+                    bottom: 4,
+                    right: 6,
+                    fontSize: "9px",
+                    fontFamily: "monospace",
+                    color: "rgba(255,255,255,0.35)",
+                    pointerEvents: "none",
+                  }}
+                >
+                  tap to activate
+                </div>
+              )}
+            </div>
+          );
+        })}
       </div>
     );
   };
@@ -798,6 +821,7 @@ export default function ViewerPage() {
           overflow: "hidden",
         }}
       >
+        {/* Header */}
         <div
           style={{
             height: "44px",
@@ -845,6 +869,7 @@ export default function ViewerPage() {
           </button>
         </div>
 
+        {/* Series thumbnails */}
         <div
           style={{
             height: "80px",
@@ -903,6 +928,7 @@ export default function ViewerPage() {
           ))}
         </div>
 
+        {/* Viewport */}
         <div
           style={{
             flex: 1,
@@ -921,78 +947,80 @@ export default function ViewerPage() {
               padding: "8px",
             }}
           >
-            {renderViewport("88%", "88%")}
+            {renderViewport("100%", "100%")}
           </div>
           {renderMissingDicomBadge()}
 
-          <div
-            style={{
-              position: "absolute",
-              top: "8px",
-              left: "8px",
-              fontFamily: "monospace",
-              fontSize: "10px",
-              color: "#fff",
-              textShadow: "1px 1px 2px rgba(0,0,0,0.9)",
-              lineHeight: 1.7,
-              pointerEvents: "none",
-            }}
-          >
-            <div>{study.patient.name}</div>
-            <div>{study.patient.sex}</div>
-            <div style={{ color: "#fbbf24" }}>{study.description}</div>
-          </div>
+          {!isMprMode && (
+            <>
+              <div
+                style={{
+                  position: "absolute",
+                  top: "8px",
+                  left: "8px",
+                  fontFamily: "monospace",
+                  fontSize: "10px",
+                  color: "#fff",
+                  textShadow: "1px 1px 2px rgba(0,0,0,0.9)",
+                  lineHeight: 1.7,
+                  pointerEvents: "none",
+                }}
+              >
+                <div>{study.patient.name}</div>
+                <div>{study.patient.sex}</div>
+                <div style={{ color: "#fbbf24" }}>{study.description}</div>
+              </div>
 
-          <div
-            style={{
-              position: "absolute",
-              top: "8px",
-              right: "8px",
-              fontFamily: "monospace",
-              fontSize: "10px",
-              color: "#fff",
-              textShadow: "1px 1px 2px rgba(0,0,0,0.9)",
-              lineHeight: 1.7,
-              textAlign: "right",
-              pointerEvents: "none",
-            }}
-          >
-            <div>W: 80 L: 40</div>
-            <div>Zoom: {Math.round(zoom * 100)}%</div>
-            <div>
-              Img: {currentSlice}/{maxSlices}
-            </div>
-          </div>
+              <div
+                style={{
+                  position: "absolute",
+                  top: "8px",
+                  right: "8px",
+                  fontFamily: "monospace",
+                  fontSize: "10px",
+                  color: "#fff",
+                  textShadow: "1px 1px 2px rgba(0,0,0,0.9)",
+                  lineHeight: 1.7,
+                  textAlign: "right",
+                  pointerEvents: "none",
+                }}
+              >
+                <div>W: 80 L: 40</div>
+                <div>Zoom: {Math.round(zoom * 100)}%</div>
+                <div>Img: {currentSlice}/{maxSlices}</div>
+              </div>
 
-          <div
-            style={{
-              position: "absolute",
-              bottom: "8px",
-              left: "8px",
-              fontFamily: "monospace",
-              fontSize: "9px",
-              color: "#9ca3af",
-              pointerEvents: "none",
-            }}
-          >
-            <div>KV: 120 mAs: 300</div>
-          </div>
+              <div
+                style={{
+                  position: "absolute",
+                  bottom: "8px",
+                  left: "8px",
+                  fontFamily: "monospace",
+                  fontSize: "9px",
+                  color: "#9ca3af",
+                  pointerEvents: "none",
+                }}
+              >
+                <div>KV: 120 mAs: 300</div>
+              </div>
 
-          <div
-            style={{
-              position: "absolute",
-              bottom: "8px",
-              right: "8px",
-              fontFamily: "monospace",
-              fontSize: "9px",
-              color: "#9ca3af",
-              textAlign: "right",
-              pointerEvents: "none",
-            }}
-          >
-            <div>Kenyatta National Hospital</div>
-            <div>{currentSeries.label}</div>
-          </div>
+              <div
+                style={{
+                  position: "absolute",
+                  bottom: "8px",
+                  right: "8px",
+                  fontFamily: "monospace",
+                  fontSize: "9px",
+                  color: "#9ca3af",
+                  textAlign: "right",
+                  pointerEvents: "none",
+                }}
+              >
+                <div>Kenyatta National Hospital</div>
+                <div>{currentSeries.label}</div>
+              </div>
+            </>
+          )}
 
           {maxSlices > 1 && (
             <div
@@ -1008,6 +1036,7 @@ export default function ViewerPage() {
                 borderRadius: "20px",
                 padding: "6px 14px",
                 backdropFilter: "blur(4px)",
+                zIndex: 10,
               }}
             >
               <button
@@ -1034,9 +1063,7 @@ export default function ViewerPage() {
                 {currentSlice} / {maxSlices}
               </span>
               <button
-                onClick={() =>
-                  setCurrentSlice(Math.min(maxSlices, currentSlice + 1))
-                }
+                onClick={() => setCurrentSlice(Math.min(maxSlices, currentSlice + 1))}
                 style={{
                   background: "none",
                   border: "none",
@@ -1051,6 +1078,7 @@ export default function ViewerPage() {
           )}
         </div>
 
+        {/* Toolbar */}
         <div
           style={{
             background: "#0d0d0d",
@@ -1060,14 +1088,7 @@ export default function ViewerPage() {
           }}
         >
           <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-            <div
-              style={{
-                flex: 1,
-                display: "flex",
-                gap: "4px",
-                overflowX: "auto",
-              }}
-            >
+            <div style={{ flex: 1, display: "flex", gap: "4px", overflowX: "auto" }}>
               {visibleTools.map((t) => (
                 <button
                   key={t.id}
@@ -1095,22 +1116,13 @@ export default function ViewerPage() {
                   }}
                 >
                   <t.icon size={16} />
-                  <span style={{ fontSize: "9px", fontWeight: 600 }}>
-                    {t.label}
-                  </span>
+                  <span style={{ fontSize: "9px", fontWeight: 600 }}>{t.label}</span>
                 </button>
               ))}
             </div>
 
             {totalPages > 1 && (
-              <div
-                style={{
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: "4px",
-                  flexShrink: 0,
-                }}
-              >
+              <div style={{ display: "flex", flexDirection: "column", gap: "4px", flexShrink: 0 }}>
                 <button
                   onClick={() => setToolPage((p) => Math.max(0, p - 1))}
                   disabled={toolPage === 0}
@@ -1126,9 +1138,7 @@ export default function ViewerPage() {
                   <ChevronLeft size={12} />
                 </button>
                 <button
-                  onClick={() =>
-                    setToolPage((p) => Math.min(totalPages - 1, p + 1))
-                  }
+                  onClick={() => setToolPage((p) => Math.min(totalPages - 1, p + 1))}
                   disabled={toolPage === totalPages - 1}
                   style={{
                     background: "#2a2a2a",
@@ -1188,6 +1198,7 @@ export default function ViewerPage() {
           </div>
         </div>
 
+        {/* Report sheet */}
         {showReport && (
           <div
             style={{
@@ -1233,25 +1244,17 @@ export default function ViewerPage() {
                         cursor: "pointer",
                         fontSize: "13px",
                         fontWeight: 600,
-                        background:
-                          activeTab === tab ? "#1A73E8" : "transparent",
+                        background: activeTab === tab ? "#1A73E8" : "transparent",
                         color: activeTab === tab ? "#fff" : "#6b7280",
                       }}
                     >
-                      {tab === "info"
-                        ? "Study Info"
-                        : `Discussion (${study.comments.length})`}
+                      {tab === "info" ? "Study Info" : `Discussion (${study.comments.length})`}
                     </button>
                   ))}
                 </div>
                 <button
                   onClick={() => setShowReport(false)}
-                  style={{
-                    background: "none",
-                    border: "none",
-                    color: "#6b7280",
-                    cursor: "pointer",
-                  }}
+                  style={{ background: "none", border: "none", color: "#6b7280", cursor: "pointer" }}
                 >
                   <XIcon size={20} />
                 </button>
@@ -1286,6 +1289,7 @@ export default function ViewerPage() {
         overflow: "hidden",
       }}
     >
+      {/* Top bar */}
       <div
         style={{
           height: "48px",
@@ -1322,9 +1326,7 @@ export default function ViewerPage() {
           <span style={{ color: "#fff", fontSize: "13px", fontWeight: 600 }}>
             {study.patient.name}
           </span>
-          <span
-            style={{ color: "#6b7280", fontSize: "12px", marginLeft: "8px" }}
-          >
+          <span style={{ color: "#6b7280", fontSize: "12px", marginLeft: "8px" }}>
             {study.patient.patientId} · {study.description}
           </span>
         </div>
@@ -1362,6 +1364,7 @@ export default function ViewerPage() {
       </div>
 
       <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
+        {/* Series sidebar */}
         <div
           style={{
             width: "160px",
@@ -1393,8 +1396,7 @@ export default function ViewerPage() {
                 setCurrentSlice(1);
               }}
               style={{
-                background:
-                  i === activeSeries ? "rgba(26,115,232,0.15)" : "transparent",
+                background: i === activeSeries ? "rgba(26,115,232,0.15)" : "transparent",
                 border: "none",
                 borderLeft: `3px solid ${i === activeSeries ? "#1A73E8" : "transparent"}`,
                 cursor: "pointer",
@@ -1427,14 +1429,13 @@ export default function ViewerPage() {
                 >
                   {s.label}
                 </div>
-                <div style={{ fontSize: "10px", color: "#4b5563" }}>
-                  {s.count} imgs
-                </div>
+                <div style={{ fontSize: "10px", color: "#4b5563" }}>{s.count} imgs</div>
               </div>
             </button>
           ))}
         </div>
 
+        {/* Main viewport */}
         <div
           style={{
             flex: 1,
@@ -1450,93 +1451,91 @@ export default function ViewerPage() {
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
-              padding: "16px",
+              padding: isMprMode ? "8px" : "16px",
             }}
           >
-            <div style={{ width: "88%", height: "88%" }}>
+            <div style={{ width: isMprMode ? "100%" : "88%", height: isMprMode ? "100%" : "88%" }}>
               {renderViewport("100%", "100%")}
             </div>
           </div>
           {renderMissingDicomBadge()}
 
-          <div
-            style={{
-              position: "absolute",
-              top: "12px",
-              left: "12px",
-              fontFamily: "monospace",
-              fontSize: "11px",
-              color: "#fff",
-              textShadow: "1px 1px 2px rgba(0,0,0,0.9)",
-              lineHeight: 1.7,
-              pointerEvents: "none",
-            }}
-          >
-            <div>{study.patient.name}</div>
-            <div>
-              {study.patient.dob} · {study.patient.sex}
-            </div>
-            <div style={{ color: "#9ca3af" }}>{study.patient.patientId}</div>
-            <div style={{ color: "#fbbf24", marginTop: "2px" }}>
-              {study.description}
-            </div>
-          </div>
+          {!isMprMode && (
+            <>
+              <div
+                style={{
+                  position: "absolute",
+                  top: "12px",
+                  left: "12px",
+                  fontFamily: "monospace",
+                  fontSize: "11px",
+                  color: "#fff",
+                  textShadow: "1px 1px 2px rgba(0,0,0,0.9)",
+                  lineHeight: 1.7,
+                  pointerEvents: "none",
+                }}
+              >
+                <div>{study.patient.name}</div>
+                <div>{study.patient.dob} · {study.patient.sex}</div>
+                <div style={{ color: "#9ca3af" }}>{study.patient.patientId}</div>
+                <div style={{ color: "#fbbf24", marginTop: "2px" }}>{study.description}</div>
+              </div>
 
-          <div
-            style={{
-              position: "absolute",
-              top: "12px",
-              right: "12px",
-              fontFamily: "monospace",
-              fontSize: "11px",
-              color: "#fff",
-              textShadow: "1px 1px 2px rgba(0,0,0,0.9)",
-              lineHeight: 1.7,
-              textAlign: "right",
-              pointerEvents: "none",
-            }}
-          >
-            <div>W: 80 L: 40</div>
-            <div>Zoom: {Math.round(zoom * 100)}%</div>
-            <div>
-              Img: {currentSlice} / {maxSlices}
-            </div>
-            <div style={{ color: "#6b7280" }}>{currentSeries.label}</div>
-          </div>
+              <div
+                style={{
+                  position: "absolute",
+                  top: "12px",
+                  right: "12px",
+                  fontFamily: "monospace",
+                  fontSize: "11px",
+                  color: "#fff",
+                  textShadow: "1px 1px 2px rgba(0,0,0,0.9)",
+                  lineHeight: 1.7,
+                  textAlign: "right",
+                  pointerEvents: "none",
+                }}
+              >
+                <div>W: 80 L: 40</div>
+                <div>Zoom: {Math.round(zoom * 100)}%</div>
+                <div>Img: {currentSlice} / {maxSlices}</div>
+                <div style={{ color: "#6b7280" }}>{currentSeries.label}</div>
+              </div>
 
-          <div
-            style={{
-              position: "absolute",
-              bottom: "12px",
-              left: "12px",
-              fontFamily: "monospace",
-              fontSize: "10px",
-              color: "#6b7280",
-              pointerEvents: "none",
-            }}
-          >
-            <div>
-              {new Date(study.studyDate).toLocaleDateString()}{" "}
-              {new Date(study.studyDate).toLocaleTimeString()}
-            </div>
-            <div>KV: 120 mAs: 300</div>
-          </div>
+              <div
+                style={{
+                  position: "absolute",
+                  bottom: "12px",
+                  left: "12px",
+                  fontFamily: "monospace",
+                  fontSize: "10px",
+                  color: "#6b7280",
+                  pointerEvents: "none",
+                }}
+              >
+                <div>
+                  {new Date(study.studyDate).toLocaleDateString()}{" "}
+                  {new Date(study.studyDate).toLocaleTimeString()}
+                </div>
+                <div>KV: 120 mAs: 300</div>
+              </div>
 
-          <div
-            style={{
-              position: "absolute",
-              bottom: "12px",
-              right: "12px",
-              fontFamily: "monospace",
-              fontSize: "10px",
-              color: "#6b7280",
-              textAlign: "right",
-              pointerEvents: "none",
-            }}
-          >
-            <div>{study.institution}</div>
-            <div>Series: {currentSeries.label}</div>
-          </div>
+              <div
+                style={{
+                  position: "absolute",
+                  bottom: "12px",
+                  right: "12px",
+                  fontFamily: "monospace",
+                  fontSize: "10px",
+                  color: "#6b7280",
+                  textAlign: "right",
+                  pointerEvents: "none",
+                }}
+              >
+                <div>{study.institution}</div>
+                <div>Series: {currentSeries.label}</div>
+              </div>
+            </>
+          )}
 
           {maxSlices > 1 && (
             <div
@@ -1553,16 +1552,12 @@ export default function ViewerPage() {
                 padding: "8px 18px",
                 backdropFilter: "blur(4px)",
                 border: "1px solid rgba(255,255,255,0.08)",
+                zIndex: 10,
               }}
             >
               <button
                 onClick={() => setCurrentSlice(Math.max(1, currentSlice - 1))}
-                style={{
-                  background: "none",
-                  border: "none",
-                  color: "#9ca3af",
-                  cursor: "pointer",
-                }}
+                style={{ background: "none", border: "none", color: "#9ca3af", cursor: "pointer" }}
               >
                 <ChevronLeft size={18} />
               </button>
@@ -1578,119 +1573,68 @@ export default function ViewerPage() {
                 {currentSlice} / {maxSlices}
               </span>
               <button
-                onClick={() =>
-                  setCurrentSlice(Math.min(maxSlices, currentSlice + 1))
-                }
-                style={{
-                  background: "none",
-                  border: "none",
-                  color: "#9ca3af",
-                  cursor: "pointer",
-                }}
+                onClick={() => setCurrentSlice(Math.min(maxSlices, currentSlice + 1))}
+                style={{ background: "none", border: "none", color: "#9ca3af", cursor: "pointer" }}
               >
                 <ChevronRight size={18} />
               </button>
             </div>
           )}
 
-          <div
-            style={{
-              position: "absolute",
-              right: "16px",
-              top: "50%",
-              transform: "translateY(-50%)",
-              display: "flex",
-              flexDirection: "column",
-              gap: "8px",
-              background: "rgba(0,0,0,0.6)",
-              borderRadius: "12px",
-              padding: "10px 8px",
-              border: "1px solid rgba(255,255,255,0.08)",
-            }}
-          >
-            <button
-              onClick={() => setZoom((z) => Math.min(3, z + 0.1))}
-              style={{
-                background: "none",
-                border: "none",
-                color: "#9ca3af",
-                cursor: "pointer",
-                padding: "4px",
-              }}
-            >
-              <ZoomIn size={16} />
-            </button>
-            <button
-              onClick={() => setZoom((z) => Math.max(0.3, z - 0.1))}
-              style={{
-                background: "none",
-                border: "none",
-                color: "#9ca3af",
-                cursor: "pointer",
-                padding: "4px",
-              }}
-            >
-              <Minus size={16} />
-            </button>
+          {/* Zoom/brightness quick controls — hidden in MPR mode to save space */}
+          {!isMprMode && (
             <div
               style={{
-                width: "1px",
-                height: "8px",
-                background: "#2a2a2a",
-                margin: "0 auto",
-              }}
-            />
-            <button
-              onClick={() => setBrightness((b) => Math.min(2.5, b + 0.1))}
-              style={{
-                background: "none",
-                border: "none",
-                color: "#9ca3af",
-                cursor: "pointer",
-                padding: "4px",
-                fontSize: "12px",
-                fontWeight: 700,
+                position: "absolute",
+                right: "16px",
+                top: "50%",
+                transform: "translateY(-50%)",
+                display: "flex",
+                flexDirection: "column",
+                gap: "8px",
+                background: "rgba(0,0,0,0.6)",
+                borderRadius: "12px",
+                padding: "10px 8px",
+                border: "1px solid rgba(255,255,255,0.08)",
               }}
             >
-              +B
-            </button>
-            <button
-              onClick={() => setBrightness((b) => Math.max(0.1, b - 0.1))}
-              style={{
-                background: "none",
-                border: "none",
-                color: "#9ca3af",
-                cursor: "pointer",
-                padding: "4px",
-                fontSize: "12px",
-                fontWeight: 700,
-              }}
-            >
-              -B
-            </button>
-            <div
-              style={{
-                width: "1px",
-                height: "8px",
-                background: "#2a2a2a",
-                margin: "0 auto",
-              }}
-            />
-            <button
-              onClick={() => handleToolClick("reset")}
-              style={{
-                background: "none",
-                border: "none",
-                color: "#6b7280",
-                cursor: "pointer",
-                padding: "4px",
-              }}
-            >
-              <RotateCcw size={14} />
-            </button>
-          </div>
+              <button
+                onClick={() => setZoom((z) => Math.min(3, z + 0.1))}
+                style={{ background: "none", border: "none", color: "#9ca3af", cursor: "pointer", padding: "4px" }}
+              >
+                <ZoomIn size={16} />
+              </button>
+              <button
+                onClick={() => setZoom((z) => Math.max(0.3, z - 0.1))}
+                style={{ background: "none", border: "none", color: "#9ca3af", cursor: "pointer", padding: "4px" }}
+              >
+                <Minus size={16} />
+              </button>
+              <div style={{ width: "1px", height: "8px", background: "#2a2a2a", margin: "0 auto" }} />
+              <button
+                onClick={() => setBrightness((b) => Math.min(2.5, b + 0.1))}
+                style={{ background: "none", border: "none", color: "#9ca3af", cursor: "pointer", padding: "4px", fontSize: "12px", fontWeight: 700 }}
+              >
+                +B
+              </button>
+              <button
+                onClick={() => setBrightness((b) => Math.max(0.1, b - 0.1))}
+                style={{ background: "none", border: "none", color: "#9ca3af", cursor: "pointer", padding: "4px", fontSize: "12px", fontWeight: 700 }}
+              >
+                -B
+              </button>
+              <div style={{ width: "1px", height: "8px", background: "#2a2a2a", margin: "0 auto" }} />
+              <button
+                onClick={() => handleToolClick("reset")}
+                style={{ background: "none", border: "none", color: "#6b7280", cursor: "pointer", padding: "4px" }}
+              >
+                <RotateCcw size={14} />
+              </button>
+            </div>
+          )}
         </div>
 
+        {/* Right panel */}
         <div
           style={{
             width: "280px",
@@ -1701,13 +1645,7 @@ export default function ViewerPage() {
             flexShrink: 0,
           }}
         >
-          <div
-            style={{
-              padding: "12px",
-              borderBottom: "1px solid #2a2a2a",
-              flexShrink: 0,
-            }}
-          >
+          <div style={{ padding: "12px", borderBottom: "1px solid #2a2a2a", flexShrink: 0 }}>
             <div
               style={{
                 fontSize: "10px",
@@ -1720,13 +1658,7 @@ export default function ViewerPage() {
             >
               TOOLS
             </div>
-            <div
-              style={{
-                display: "grid",
-                gridTemplateColumns: "repeat(4, 1fr)",
-                gap: "4px",
-              }}
-            >
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "4px" }}>
               {visibleTools.map((t) => (
                 <button
                   key={t.id}
@@ -1753,21 +1685,13 @@ export default function ViewerPage() {
                   }}
                 >
                   <t.icon size={14} />
-                  <span style={{ fontSize: "9px", fontWeight: 600 }}>
-                    {t.label}
-                  </span>
+                  <span style={{ fontSize: "9px", fontWeight: 600 }}>{t.label}</span>
                 </button>
               ))}
             </div>
           </div>
 
-          <div
-            style={{
-              display: "flex",
-              borderBottom: "1px solid #2a2a2a",
-              flexShrink: 0,
-            }}
-          >
+          <div style={{ display: "flex", borderBottom: "1px solid #2a2a2a", flexShrink: 0 }}>
             {(["info", "discussion"] as const).map((tab) => (
               <button
                 key={tab}
@@ -1789,14 +1713,9 @@ export default function ViewerPage() {
                 }}
               >
                 {tab === "info" ? (
-                  <>
-                    <FileText size={13} /> Study Info
-                  </>
+                  <><FileText size={13} /> Study Info</>
                 ) : (
-                  <>
-                    <MessageCircle size={13} /> Discussion{" "}
-                    {study.comments.length > 0 && `(${study.comments.length})`}
-                  </>
+                  <><MessageCircle size={13} /> Discussion {study.comments.length > 0 && `(${study.comments.length})`}</>
                 )}
               </button>
             ))}
