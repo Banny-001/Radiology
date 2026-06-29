@@ -46,7 +46,6 @@ export default function DicomViewer({
 }: DicomViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
   const [fileList, setFileList] = useState<string[]>([]);
   const [imageLoaded, setImageLoaded] = useState(false);
 
@@ -152,7 +151,6 @@ export default function DicomViewer({
 
     async function loadImage(element: HTMLDivElement) {
       try {
-        setLoading(true);
         setImageLoaded(false);
 
         const currentFile = seriesFileList[safeIndex];
@@ -189,8 +187,6 @@ export default function DicomViewer({
         console.error("[DicomViewer] Failed to load image:", err);
         const msg = err instanceof Error ? err.message : String(err);
         setError(`Failed to load DICOM:\n${msg}`);
-      } finally {
-        setLoading(false);
       }
     }
   }, [safeIndex, seriesFileList, studyId]);
@@ -244,11 +240,6 @@ export default function DicomViewer({
   //   once after the first image loads, not re-run on every slice change
 
   // ── Apply viewport transformations ────────────────────────────────────────
-  //
-  // After setViewport(), updateImage() forces Cornerstone to re-render the full
-  // canvas — including all Cornerstone Tools annotation overlays (length lines,
-  // angle arcs, text labels). Without it, annotation labels can lag behind the
-  // new zoom level and show stale positions or values.
   useEffect(() => {
     if (!containerRef.current || !window.cornerstone || !imageLoaded) return;
     const el = containerRef.current;
@@ -262,8 +253,6 @@ export default function DicomViewer({
       viewport.invert = isInverted;
       viewport.translation = { x: offsetX, y: offsetY };
       window.cornerstone.setViewport(el, viewport);
-      // ↑ setViewport triggers one render; updateImage forces a second pass that
-      //   redraws all tool layers — this is what keeps measurement values current
       window.cornerstone.updateImage(el);
     } catch (err) {
       console.error("[DicomViewer] Viewport update failed:", err);
@@ -271,22 +260,10 @@ export default function DicomViewer({
   }, [zoom, rotation, flipH, flipV, isInverted, offsetX, offsetY, imageLoaded]);
 
   // ── Mobile touch handling ─────────────────────────────────────────────────
-  //
-  // React 17+ may attach touch handlers as passive, which blocks preventDefault()
-  // and lets the browser hijack scroll. To guarantee non-passive semantics we add
-  // listeners directly to the DOM element with { passive: false }.
-  //
-  // Three gestures handled:
-  //   1. Single-finger pan   → forwarded as mousedown/mousemove/mouseup so the
-  //                            active Cornerstone tool (pan, wwwl, length, etc.) reacts
-  //   2. Two-finger pinch    → directly adjusts viewport.scale + calls updateImage
-  //                            so annotations stay visible at the new zoom
-  //   3. Vertical swipe      → changes the current slice (imageIndex) within the series
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
 
-    // ── Touch state (local to this effect closure) ──────────────────────────
     let touchStartX: number | null = null;
     let touchStartY: number | null = null;
     let pinchDist: number | null = null;
@@ -311,12 +288,9 @@ export default function DicomViewer({
       );
     };
 
-    // ── touchstart ──────────────────────────────────────────────────────────
     const onStart = (e: TouchEvent) => {
       e.preventDefault();
-
       if (e.touches.length === 2) {
-        // Entering pinch — end any ongoing single-finger interaction first
         isPinching = true;
         pinchDist = getDistance(e.touches[0], e.touches[1]);
         el.dispatchEvent(
@@ -336,38 +310,29 @@ export default function DicomViewer({
       }
     };
 
-    // ── touchmove ───────────────────────────────────────────────────────────
     const onMove = (e: TouchEvent) => {
       e.preventDefault();
-
       if (e.touches.length === 2 && pinchDist !== null) {
-        // Pinch-to-zoom: scale viewport directly so Cornerstone tools see the change
         const newDist = getDistance(e.touches[0], e.touches[1]);
         const delta = newDist / pinchDist;
         pinchDist = newDist;
-
         if (!csEnabledRef.current) return;
         try {
           const vp = window.cornerstone.getViewport(el);
           if (!vp) return;
           vp.scale = Math.max(0.1, Math.min(10, vp.scale * delta));
           window.cornerstone.setViewport(el, vp);
-          // updateImage redraws annotation overlays at the new scale —
-          // this is what keeps angle/length labels current during pinch
           window.cornerstone.updateImage(el);
         } catch {
           /* ignore mid-gesture errors */
         }
       } else if (e.touches.length === 1 && !isPinching) {
-        // Single-finger pan → forward to Cornerstone active tool
         fireMouseEvent("mousemove", e.touches[0]);
       }
     };
 
-    // ── touchend ────────────────────────────────────────────────────────────
     const onEnd = (e: TouchEvent) => {
       e.preventDefault();
-
       if (isPinching) {
         isPinching = false;
         pinchDist = null;
@@ -393,10 +358,6 @@ export default function DicomViewer({
           setLocalIndex(next);
           onImageIndexChangeRef.current?.(next);
         } else if (Math.abs(dx) < 10 && Math.abs(dy) < 10) {
-          // It's a tap — dispatch a click so measurement tool handlers
-          // in ViewerPage's handleViewportClick fire correctly.
-          // The click bubbles up to the outer viewport div where onClick
-          // is attached; clientX/Y are used for getBoundingClientRect subtraction.
           el.dispatchEvent(
             new MouseEvent("click", {
               bubbles: true,
@@ -411,7 +372,6 @@ export default function DicomViewer({
         }
       }
 
-      // Always fire mouseup so Cornerstone tools complete their interaction
       el.dispatchEvent(
         new MouseEvent("mouseup", {
           bubbles: true,
@@ -475,33 +435,9 @@ export default function DicomViewer({
           width: "100%",
           height: "100%",
           background: "#000",
-          /**
-           * touch-action: none
-           * Tells the browser to hand ALL touch events to JavaScript without
-           * trying to pan/zoom the page itself. This is what makes single-finger
-           * pan and pinch-to-zoom work in the viewer without accidentally
-           * scrolling the surrounding page.
-           */
           touchAction: "none",
         }}
       />
-
-      {/* {loading && (
-        <div
-          style={{
-            position: "absolute",
-            inset: 0,
-            background: "rgba(0,0,0,0.6)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            color: "#9ca3af",
-            fontSize: "12px",
-          }}
-        >
-          Loading DICOM...
-        </div>
-      )} */}
     </div>
   );
 }
