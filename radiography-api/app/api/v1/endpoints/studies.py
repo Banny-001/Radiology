@@ -11,7 +11,7 @@ from uuid import UUID, uuid4
 import aiofiles
 import numpy as np
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse  # ← added StreamingResponse
 from PIL import Image
 from pydicom import dcmread
 from pydicom.dataset import Dataset, FileDataset
@@ -87,6 +87,49 @@ def _count_dicom_like_files(folder: str) -> int:
         if ext in DICOM_LIKE_EXTENSIONS:
             count += 1
     return count
+
+
+def _dicom_to_jpeg(file_path: str, wc: float | None, ww: float | None, quality: int) -> bytes:
+    """Read a DICOM file and return JPEG bytes.
+    Applies RescaleSlope/Intercept + window/level → 8-bit → JPEG.
+    Result is ~30-60 KB instead of 529 KB raw DICOM = 10× smaller.
+    """
+    ds = dcmread(file_path)
+    pixels = ds.pixel_array.astype(np.float32)
+
+    # Map stored values → Hounsfield Units (essential for CT)
+    slope = float(getattr(ds, "RescaleSlope", 1) or 1)
+    intercept = float(getattr(ds, "RescaleIntercept", 0) or 0)
+    pixels = pixels * slope + intercept
+
+    # Use DICOM window tags if caller didn't specify
+    if wc is None or ww is None:
+        dicom_wc = getattr(ds, "WindowCenter", None)
+        dicom_ww = getattr(ds, "WindowWidth", None)
+        if dicom_wc is not None and dicom_ww is not None:
+            # Some DICOMs store these as sequences
+            wc = float(dicom_wc[0] if hasattr(dicom_wc, "__len__") else dicom_wc)
+            ww = float(dicom_ww[0] if hasattr(dicom_ww, "__len__") else dicom_ww)
+        else:
+            # Auto-window from 2nd–98th percentile
+            lo_pct, hi_pct = np.percentile(pixels, [2, 98])
+            wc = float((lo_pct + hi_pct) / 2)
+            ww = float(max(hi_pct - lo_pct, 1))
+
+    lo = wc - ww / 2.0
+    hi = wc + ww / 2.0
+    pixels = np.clip(pixels, lo, hi)
+    pixels = ((pixels - lo) / (hi - lo) * 255).astype(np.uint8)
+
+    # Multi-frame DICOM: take first frame only
+    if pixels.ndim == 3 and pixels.shape[0] not in (3, 4):
+        pixels = pixels[0]
+
+    mode = "RGB" if pixels.ndim == 3 else "L"
+    img = Image.fromarray(pixels, mode=mode)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    return buf.getvalue()
 
 
 # ── Image → DICOM conversion ─────────────────────────────────────────────
@@ -260,24 +303,17 @@ async def serve_dicom_file(
     filename: str,
     svc: StudyService = Depends(get_service),
 ):
-    """Serve raw DICOM bytes for Cornerstone's WADO URI loader.
-
-    The viewer builds URLs like:
-        wadouri:/api/v1/studies/{studyId}/dicom/{filename}
-    Cornerstone strips the wadouri: prefix and fetches this endpoint.
-    """
+    """Serve raw DICOM bytes for Cornerstone's WADO URI loader."""
     study = await svc.get(study_id)
     if not study:
         raise HTTPException(status_code=404, detail="Study not found")
     if not study.dicom_path or not os.path.isdir(study.dicom_path):
         raise HTTPException(status_code=404, detail="No DICOM files for this study")
 
-    # Path-traversal guard
     if not filename or "/" in filename or "\\" in filename or filename.startswith(".."):
         raise HTTPException(status_code=400, detail="Invalid filename")
 
     file_path = os.path.join(study.dicom_path, filename)
-
     real_file = os.path.realpath(file_path)
     real_root = os.path.realpath(study.dicom_path)
     if not real_file.startswith(real_root + os.sep):
@@ -290,6 +326,51 @@ async def serve_dicom_file(
         file_path,
         media_type="application/dicom",
         headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
+@router.get("/{study_id}/dicom/{filename}/preview")
+async def serve_dicom_preview(
+    study_id: UUID,
+    filename: str,
+    wc: float | None = Query(default=None, description="Window center (HU)"),
+    ww: float | None = Query(default=None, description="Window width (HU)"),
+    quality: int = Query(default=80, ge=50, le=95),
+    svc: StudyService = Depends(get_service),
+):
+    """Serve a JPEG preview of one DICOM slice.
+    ~30-60 KB vs 529 KB raw DICOM → 10× faster browser loading.
+    Cached 24 h so repeat visits are instant.
+    """
+    study = await svc.get(study_id)
+    if not study:
+        raise HTTPException(status_code=404, detail="Study not found")
+    if not study.dicom_path or not os.path.isdir(study.dicom_path):
+        raise HTTPException(status_code=404, detail="No DICOM files for this study")
+
+    if not filename or "/" in filename or "\\" in filename or filename.startswith(".."):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    file_path = os.path.join(study.dicom_path, filename)
+    real_file = os.path.realpath(file_path)
+    real_root = os.path.realpath(study.dicom_path)
+    if not real_file.startswith(real_root + os.sep):
+        raise HTTPException(status_code=403, detail="Access denied")
+    if not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail=f"File '{filename}' not found")
+
+    loop = asyncio.get_event_loop()
+    jpeg_bytes: bytes = await loop.run_in_executor(
+        None, _dicom_to_jpeg, file_path, wc, ww, quality
+    )
+
+    return StreamingResponse(
+        io.BytesIO(jpeg_bytes),
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "public, max-age=86400",   # 24 h browser cache
+            "Content-Length": str(len(jpeg_bytes)),
+        },
     )
 
 
@@ -310,9 +391,6 @@ async def delete_study(
     study_id: UUID,
     svc: StudyService = Depends(get_service),
 ):
-    # Capture dicom_path BEFORE deleting the DB row — once the row is gone
-    # we can't look it up. Without this, every deletion leaves the DICOM
-    # folder on disk and storage fills up over time.
     study = await svc.get(study_id)
     if not study:
         raise HTTPException(status_code=404, detail="Study not found")
@@ -323,8 +401,6 @@ async def delete_study(
     if not deleted:
         raise HTTPException(status_code=404, detail="Study not found")
 
-    # Remove files after the DB commit succeeds.
-    # ignore_errors=True so a missing folder never causes a 500.
     if dicom_path and os.path.isdir(dicom_path):
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(
