@@ -486,7 +486,7 @@ export default function DicomViewer({
         }}
       />
 
-      {loading && (
+      {/* {loading && (
         <div
           style={{
             position: "absolute",
@@ -501,7 +501,7 @@ export default function DicomViewer({
         >
           Loading DICOM...
         </div>
-      )}
+      )} */}
     </div>
   );
 }
