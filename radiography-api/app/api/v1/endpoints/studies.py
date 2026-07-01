@@ -543,13 +543,34 @@ def _volume_locks_guard() -> asyncio.Lock:
 
 
 class SeriesGroup:
-    __slots__ = ("uid", "files", "modality", "description")
+    __slots__ = ("uid", "files", "modality", "description", "is_scout")
 
     def __init__(self, uid: str, files: list[str], modality: str, description: str):
         self.uid = uid
         self.files = files
         self.modality = modality
         self.description = description
+        self.is_scout = False
+
+
+# Series-description keywords that reliably indicate a scout/localizer/
+# topogram acquisition — the quick low-res reference image scanners take
+# before the real volumetric run, not itself something you can reconstruct
+# coronal/sagittal planes from.
+_SCOUT_KEYWORDS = ("scout", "localizer", "localiser", "topogram", "survey")
+
+
+def _looks_like_scout(description: str, file_count: int, is_primary: bool) -> bool:
+    if is_primary:
+        return False
+    desc = description.lower()
+    if any(k in desc for k in _SCOUT_KEYWORDS):
+        return True
+    # No description to go on — fall back to "small series that isn't the
+    # primary volumetric run is probably a scout/reference image", since a
+    # real second cross-sectional series large enough to reconstruct is
+    # comparatively rare in a single flat upload folder.
+    return file_count <= 5
 
 
 # Per-process cache of the grouped series list, same mtime-invalidation
@@ -611,6 +632,8 @@ def _all_series_groups(folder: str) -> list[SeriesGroup]:
         modality, description = meta.get(uid, ("", ""))
         result.append(SeriesGroup(uid, group_files, modality, description))
     result.sort(key=lambda g: len(g.files), reverse=True)
+    for i, g in enumerate(result):
+        g.is_scout = _looks_like_scout(g.description, len(g.files), is_primary=(i == 0))
 
     _SERIES_GROUPS_CACHE[folder] = (dir_mtime, result)
     return result
@@ -952,6 +975,7 @@ async def list_study_series(
                 "count": len(g.files),
                 "modality": g.modality,
                 "description": g.description,
+                "is_scout": g.is_scout,
             }
             for i, g in enumerate(groups)
         ]

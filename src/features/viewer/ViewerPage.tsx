@@ -16,7 +16,7 @@ import {
 } from "lucide-react";
 import { useStudies } from "../../context/StudyContext";
 import { useAuth } from "../../context/AuthContext";
-import { getStudySeries, type SeriesInfo } from "../../services/studyService";
+import { getStudySeries, getDicomFileList, type SeriesInfo } from "../../services/studyService";
 import { SERIES_MAP, TOOLS } from "./components/viewerConstants";
 import { renderImage } from "./components/medicalImages";
 import { StudyInfoPanel } from "./components/StudyInfoPanel";
@@ -50,12 +50,15 @@ export default function ViewerPage() {
   const study = studies.find((s) => s.id === id);
 
   // ── Real DICOM series list ────────────────────────────────────────────
-  // Replaces the old SERIES_MAP placeholder (generic per-modality labels
-  // completely unrelated to what was actually uploaded). The backend now
-  // groups the uploaded folder by real SeriesInstanceUID (see
-  // /studies/{id}/series in studies.py), largest series first, so each
-  // sidebar tab corresponds to an actual distinct series and switching
-  // tabs fetches/reconstructs that real series' files.
+  // The upload folder can contain several real DICOM series mixed together
+  // (a true volumetric axial run, a scout/localizer, sometimes other
+  // reformats) — see _all_series_groups in studies.py. There is normally
+  // only ONE genuinely different acquisition worth exposing as its own tab:
+  // the scout/localizer (a single reference image, not something you can
+  // reconstruct coronal/sagittal planes from). Coronal and Sagittal are NOT
+  // separate series — they're always MPR reconstructions of the primary
+  // (largest) series' volume, so the sidebar is a fixed 4-tab set (Axial /
+  // Coronal / Sagittal / Scout) rather than one tab per real series.
   const [realSeries, setRealSeries] = useState<SeriesInfo[] | null>(null);
   useEffect(() => {
     if (!study?.id || !study.dicom_path) {
@@ -75,18 +78,39 @@ export default function ViewerPage() {
     };
   }, [study?.id, study?.dicom_path]);
 
-  // Real series list for the sidebar tabs, falling back to the old generic
-  // per-modality placeholder only when there's no real uploaded DICOM data
-  // (e.g. a demo study) or the /series call hasn't resolved yet.
-  const series =
-    realSeries && realSeries.length > 0
-      ? realSeries.map((s, i) => ({
-          label: s.description || (s.modality ? s.modality : `Series ${i + 1}`),
-          count: s.count,
-        }))
-      : (study ? (SERIES_MAP[study.modality] ?? SERIES_MAP.CT) : SERIES_MAP.CT);
+  // Index 0 (largest-first, see _all_series_groups) is always the true
+  // volumetric run that both the Axial pane and the Coronal/Sagittal/MPR
+  // reconstructions read from.
+  const primarySeriesIndex = 0;
+  // The first real series flagged as a scout/localizer by the backend, if
+  // any — null when the study only has the one primary series (in which
+  // case the Scout tab is simply disabled).
+  const scoutSeriesIndex = (() => {
+    if (!realSeries || realSeries.length < 2) return null;
+    const idx = realSeries.findIndex((s) => s.is_scout);
+    return idx >= 0 ? idx : null;
+  })();
 
-  const [activeSeries, setActiveSeries] = useState(0);
+  type ViewMode = "axial" | "coronal" | "sagittal" | "scout";
+  const VIEW_LABELS: Record<ViewMode, string> = {
+    axial: "Axial",
+    coronal: "Coronal",
+    sagittal: "Sagittal",
+    scout: "Scout",
+  };
+  const [activeView, setActiveView] = useState<ViewMode>("axial");
+  // Fixed 4-tab set — Scout is greyed out (not clickable) only when no
+  // scout/localizer series was actually detected in the upload.
+  const viewTabs: { id: ViewMode; label: string; disabled: boolean }[] = [
+    { id: "axial", label: "Axial", disabled: false },
+    { id: "coronal", label: "Coronal", disabled: false },
+    { id: "sagittal", label: "Sagittal", disabled: false },
+    { id: "scout", label: "Scout", disabled: scoutSeriesIndex === null },
+  ];
+  const selectView = (id: ViewMode) => {
+    if (viewTabs.find((t) => t.id === id)?.disabled) return;
+    setActiveView(id);
+  };
   const [currentSlice, setCurrentSlice] = useState(1);
   const [brightness, setBrightness] = useState(1);
   const [zoom, setZoom] = useState(1);
@@ -129,32 +153,55 @@ export default function ViewerPage() {
   const [coronalSlice, setCoronalSlice] = useState<number | null>(null);
   const [sagittalSlice, setSagittalSlice] = useState<number | null>(null);
 
-  // The backend's /files, /mpr/* and /series endpoints all key off the same
-  // real per-series grouping now (see _all_series_groups in studies.py), so
-  // whichever series tab is active, the axial pane, the MPR volume, and the
-  // sidebar all agree on the same file set — no more client-side chunking
-  // that could disagree with what the server actually used.
-  const seriesCountForVolume = series.length;
-  // The volume itself is now built server-side (see studies.py /mpr/*) from
-  // raw DICOM pixel data, cached in memory per study — this hook only
-  // fetches the resulting dimensions, not hundreds of slice images.
+  // Coronal/Sagittal reconstruction is needed whenever the MPR grid is open
+  // OR the user has a coronal/sagittal tab selected as the single-panel
+  // view — always built from the primary series' volume, never whichever
+  // "series tab" is active (there is no such thing as a separate coronal
+  // series to switch to). The volume itself is built server-side (see
+  // studies.py /mpr/*) from raw DICOM pixel data, cached per study — this
+  // hook only fetches the resulting dimensions, not hundreds of images.
+  const needsVolume =
+    isMprMode || activeView === "coronal" || activeView === "sagittal";
   const { meta: mprMeta, loading: mprLoading, error: mprError } = useMprMeta(
     study?.id ?? "",
-    activeSeries,
-    seriesCountForVolume,
-    isMprMode && !!study?.dicom_path,
+    primarySeriesIndex,
+    1,
+    needsVolume && !!study?.dicom_path,
   );
   const coronalMax = mprMeta?.height ?? 1;
   const sagittalMax = mprMeta?.width ?? 1;
 
   // Cheap, always-on position indicator for the slice scrubber — sampled
   // from a bounded number of slices, so unlike the full MPR volume this
-  // doesn't need to be gated behind MPR mode.
+  // doesn't need to be gated behind MPR mode. Only meaningful for the axial
+  // pane (it silhouettes the primary series' own slices).
   const { strip: localizerStrip } = useLocalizerStrip(
     study?.id ?? "",
-    activeSeries,
-    !!study?.dicom_path,
+    primarySeriesIndex,
+    !!study?.dicom_path && activeView === "axial",
   );
+
+  // The scout/localizer's own (usually single) file, fetched separately
+  // from the primary series so its raw image can be shown as-is — it's not
+  // part of the reconstructable volume, just a plain reference image.
+  const [scoutFile, setScoutFile] = useState<string | null>(null);
+  useEffect(() => {
+    if (scoutSeriesIndex === null || !study?.id || !study.dicom_path) {
+      setScoutFile(null);
+      return;
+    }
+    let cancelled = false;
+    getDicomFileList(study.id, scoutSeriesIndex)
+      .then((files) => {
+        if (!cancelled) setScoutFile(files[0] ?? null);
+      })
+      .catch(() => {
+        if (!cancelled) setScoutFile(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [study?.id, study?.dicom_path, scoutSeriesIndex]);
 
   // ── Measurement state ──────────────────────────────────────────────────
   const [measurements, setMeasurements] = useState<Measurement[]>([]);
@@ -173,9 +220,13 @@ export default function ViewerPage() {
   const sagittalMaxRef = useRef(sagittalMax);
   sagittalMaxRef.current = sagittalMax;
 
-  const placeholderMaxSlices = series[activeSeries]?.count ?? series[0]?.count ?? 1;
+  // Only meaningful before DicomViewer's real count arrives, or for the
+  // no-real-DICOM-data placeholder/demo path.
+  const axialPlaceholderMaxSlices = study
+    ? ((SERIES_MAP[study.modality] ?? SERIES_MAP.CT)[0]?.count ?? 1)
+    : 1;
   const maxSlicesForTouch =
-    dicomFileCount > 0 ? dicomFileCount : placeholderMaxSlices;
+    dicomFileCount > 0 ? dicomFileCount : axialPlaceholderMaxSlices;
   const maxSlicesRef = useRef(maxSlicesForTouch);
   maxSlicesRef.current = maxSlicesForTouch;
 
@@ -385,15 +436,26 @@ export default function ViewerPage() {
         setHoverPoint(null);
         return;
       }
+      // In the MPR grid, arrow keys always drive the shared axial (Z)
+      // cursor; in single-panel mode they step whichever plane is showing.
+      const step = isMprMode
+        ? stepAxial
+        : activeView === "coronal"
+          ? stepCoronal
+          : activeView === "sagittal"
+            ? stepSagittal
+            : activeView === "scout"
+              ? () => {}
+              : stepAxial;
       if (e.key === "ArrowUp" || e.key === "ArrowRight") {
-        stepAxial(1);
+        step(1);
       } else if (e.key === "ArrowDown" || e.key === "ArrowLeft") {
-        stepAxial(-1);
+        step(-1);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  }, [isMprMode, activeView]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handlePostComment = () => {
     if (!comment.trim() || !user) return;
@@ -483,8 +545,34 @@ export default function ViewerPage() {
     );
   }
 
-  const currentSeries = series[activeSeries] ?? series[0];
-  const maxSlices = dicomFileCount > 0 ? dicomFileCount : currentSeries.count;
+  const maxSlices = dicomFileCount > 0 ? dicomFileCount : axialPlaceholderMaxSlices;
+
+  // The "current view" concept generalizes currentSlice/maxSlices across
+  // whichever of the 4 tabs is active, so the HUD counters, prev/next
+  // buttons, and keyboard/scrubber controls all operate on the right axis
+  // regardless of which plane is actually on screen.
+  const activeMaxSlices =
+    activeView === "coronal"
+      ? coronalMax
+      : activeView === "sagittal"
+        ? sagittalMax
+        : activeView === "scout"
+          ? 1
+          : maxSlices;
+  const activeCurrentSlice =
+    activeView === "coronal"
+      ? (coronalSlice ?? Math.ceil(coronalMax / 2))
+      : activeView === "sagittal"
+        ? (sagittalSlice ?? Math.ceil(sagittalMax / 2))
+        : activeView === "scout"
+          ? 1
+          : currentSlice;
+  const setActiveCurrentSlice = (v: number) => {
+    if (activeView === "coronal") setCoronalSlice(Math.max(1, Math.min(coronalMax, v)));
+    else if (activeView === "sagittal") setSagittalSlice(Math.max(1, Math.min(sagittalMax, v)));
+    else if (activeView === "axial") setCurrentSlice(Math.max(1, Math.min(maxSlices, v)));
+    // scout: single static image, nothing to step
+  };
 
   const TOOLS_PER_PAGE = isMobile ? 8 : TOOLS.length;
   const totalPages = Math.ceil(TOOLS.length / TOOLS_PER_PAGE);
@@ -883,7 +971,7 @@ export default function ViewerPage() {
           imageIndex={currentSlice - 1}
           offsetX={offset.x}
           offsetY={offset.y}
-          activeSeries={activeSeries}
+          activeSeries={primarySeriesIndex}
           onFileCountChange={setDicomFileCount}
         />
       </div>
@@ -985,7 +1073,11 @@ export default function ViewerPage() {
   // right URL for the current slice, same as the axial pane. Like the axial
   // pane, clicking/dragging with the default "pan" tool repositions the
   // shared crosshair, live-updating the other two panes.
-  const renderPlanePanel = (plane: "coronal" | "sagittal", label: string) => {
+  const renderPlanePanel = (
+    plane: "coronal" | "sagittal",
+    label: string,
+    standalone = false,
+  ) => {
     const sliceMax = plane === "coronal" ? coronalMax : sagittalMax;
     const sliceValue =
       (plane === "coronal" ? coronalSlice : sagittalSlice) ??
@@ -994,10 +1086,16 @@ export default function ViewerPage() {
     const planeSrc = mprMeta
       ? `/api/v1/studies/${study.id}/mpr/${plane}?${plane === "coronal" ? "y" : "x"}=${
           sliceValue - 1
-        }&series=${activeSeries}&series_count=${series.length}`
+        }&series=${primarySeriesIndex}`
       : null;
 
-    const isCrosshair = activeTool === "pan";
+    // Inside the MPR grid, "pan" repositions the shared crosshair (that's
+    // the whole point of the linked quad view). As a standalone single
+    // panel there's no other pane to link to, so "pan" just pans the image
+    // like it does for the axial view, and scrolling/dragging with the
+    // "scroll" tool (or the mouse wheel) moves through the reconstructed
+    // slices instead.
+    const isCrosshair = !standalone && activeTool === "pan";
 
     const localPoint = (e: React.MouseEvent): Point => {
       const rect = e.currentTarget.getBoundingClientRect();
@@ -1068,6 +1166,11 @@ export default function ViewerPage() {
         return;
       }
       if (isMeasurementTool(activeTool)) return;
+      if (standalone && activeTool === "pan") {
+        setIsDragging(true);
+        setDragStart({ x: e.clientX - offset.x, y: e.clientY - offset.y });
+        return;
+      }
       if (activeTool === "wl" || activeTool === "scroll" || activeTool === "zoom") {
         setIsDragging(true);
         setDragStart({ x: e.clientX, y: e.clientY });
@@ -1089,7 +1192,9 @@ export default function ViewerPage() {
         setHoverPoint(localPoint(e));
       }
       if (!isDragging) return;
-      if (activeTool === "wl") {
+      if (standalone && activeTool === "pan") {
+        setOffset({ x: e.clientX - dragStart.x, y: e.clientY - dragStart.y });
+      } else if (activeTool === "wl") {
         const dy = e.clientY - dragStart.y;
         if (Math.abs(dy) > 1) {
           setBrightness((b) => Math.max(0.1, Math.min(2.5, b - dy * 0.005)));
@@ -1116,9 +1221,11 @@ export default function ViewerPage() {
       ? "crosshair"
       : isMeasurementTool(activeTool)
         ? "crosshair"
-        : activeTool === "zoom"
-          ? "zoom-in"
-          : activeTool === "wl" || activeTool === "scroll"
+        : standalone && activeTool === "pan"
+          ? (isDragging ? "grabbing" : "grab")
+          : activeTool === "zoom"
+            ? "zoom-in"
+            : activeTool === "wl" || activeTool === "scroll"
             ? "ns-resize"
             : "default";
 
@@ -1195,77 +1302,94 @@ export default function ViewerPage() {
     );
   };
 
-  // ── 4th quadrant: MIP (a real 3D-derived render, not a placeholder) ─────
-  // Full rotatable GPU volume rendering + freeform oblique planes remain a
-  // bigger follow-up, but a Maximum Intensity Projection is a real,
-  // standard "3D" radiology view computed server-side from the same cached
-  // volume the coronal/sagittal panes use — no reason to leave this
-  // quadrant fake in the meantime.
-  const render3dPanel = () => {
-    const mipSrc = mprMeta
-      ? `/api/v1/studies/${study.id}/mpr/mip?series=${activeSeries}&series_count=${series.length}`
-      : null;
-    // MIP's vertical axis IS the axial (Z) axis, so a line at the current
-    // slice's fraction down that axis shows exactly what level of the body
-    // the axial/coronal/sagittal panes are currently looking at — same
-    // idea as the crosshair lines, just for "where am I along the body."
-    const axFrac = maxSlices > 1 ? (currentSlice - 1) / (maxSlices - 1) : 0.5;
+  // ── Scout panel ──────────────────────────────────────────────────────────
+  // The scout/localizer is a single reference image, not part of the
+  // reconstructable volume — so this just shows it as-is (a plain <img>,
+  // no MPR math), both as the 4th MPR-grid quadrant and as its own
+  // standalone tab. Pan/zoom follow the shared transform state; there's no
+  // "slice" to scroll through.
+  const scoutSrc = scoutFile
+    ? `/api/v1/studies/${study.id}/dicom/${encodeURIComponent(scoutFile)}/preview`
+    : null;
+
+  const renderScoutPanel = (standalone = false) => {
+    const isPan = activeTool === "pan";
+
+    const handleMouseDown = (e: React.MouseEvent) => {
+      if (!standalone) return;
+      if (isPan) {
+        setIsDragging(true);
+        setDragStart({ x: e.clientX - offset.x, y: e.clientY - offset.y });
+      } else if (activeTool === "wl" || activeTool === "zoom") {
+        setIsDragging(true);
+        setDragStart({ x: e.clientX, y: e.clientY });
+      }
+    };
+
+    const handleMouseMove = (e: React.MouseEvent) => {
+      if (!standalone || !isDragging) return;
+      if (isPan) {
+        setOffset({ x: e.clientX - dragStart.x, y: e.clientY - dragStart.y });
+      } else if (activeTool === "wl") {
+        const dy = e.clientY - dragStart.y;
+        if (Math.abs(dy) > 1) {
+          setBrightness((b) => Math.max(0.1, Math.min(2.5, b - dy * 0.005)));
+          setDragStart({ x: e.clientX, y: e.clientY });
+        }
+      } else if (activeTool === "zoom") {
+        const dy = e.clientY - dragStart.y;
+        if (Math.abs(dy) > 1) {
+          setZoom((z) => Math.max(0.3, Math.min(3, z - dy * 0.003)));
+          setDragStart({ x: e.clientX, y: e.clientY });
+        }
+      }
+    };
+
+    const handleMouseUp = () => setIsDragging(false);
 
     return (
-      <div style={{ width: "100%", height: "100%", position: "relative" }}>
-        {mipSrc && (
+      <div
+        style={{
+          width: "100%",
+          height: "100%",
+          position: "relative",
+          cursor: !standalone ? "default" : isPan ? (isDragging ? "grabbing" : "grab") : "default",
+        }}
+        onMouseDown={handleMouseDown}
+        onMouseMove={handleMouseMove}
+        onMouseUp={handleMouseUp}
+        onMouseLeave={handleMouseUp}
+      >
+        {scoutSrc ? (
           <MprPlaneImage
-            src={mipSrc}
+            src={scoutSrc}
             brightness={brightness}
             isInverted={isInverted}
-            zoom={1}
-            rotation={0}
-            flipH={false}
-            flipV={false}
-            offsetX={0}
-            offsetY={0}
+            zoom={standalone ? zoom : 1}
+            rotation={standalone ? rotation : 0}
+            flipH={standalone ? flipH : false}
+            flipV={standalone ? flipV : false}
+            offsetX={standalone ? offset.x : 0}
+            offsetY={standalone ? offset.y : 0}
           />
-        )}
-        {mipSrc && (
-          <svg
-            style={{
-              position: "absolute",
-              inset: 0,
-              width: "100%",
-              height: "100%",
-              pointerEvents: "none",
-              zIndex: 6,
-            }}
-          >
-            <line
-              x1="0"
-              y1={`${axFrac * 100}%`}
-              x2="100%"
-              y2={`${axFrac * 100}%`}
-              stroke="#facc15"
-              strokeWidth={1}
-              strokeDasharray="5 4"
-              opacity={0.85}
-            />
-          </svg>
-        )}
-        {mprLoading && !mipSrc && renderMprSpinner()}
-        {mprError && (
+        ) : (
           <div
             style={{
-              position: "absolute",
-              inset: 0,
+              width: "100%",
+              height: "100%",
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
-              color: "#ef4444",
+              color: "#6b7280",
               fontSize: 10,
               fontFamily: "monospace",
               textAlign: "center",
               padding: 12,
             }}
           >
-            {mprError}
+            {scoutSeriesIndex === null
+              ? "No scout/localizer image found in this study"
+              : "Loading…"}
           </div>
         )}
         <div
@@ -1283,7 +1407,7 @@ export default function ViewerPage() {
             zIndex: 5,
           }}
         >
-          3D · MIP projection · Level {currentSlice}/{maxSlices}
+          Scout
         </div>
       </div>
     );
@@ -1291,28 +1415,39 @@ export default function ViewerPage() {
 
   // ── Viewport: single panel OR 2×2 real, crosshair-linked MPR quad ───────
   const renderViewport = (w: string, h: string) => {
-    if (!isMprMode) return renderSinglePanel(w, h);
-
-    return (
-      <div
-        style={{
-          width: w,
-          height: h,
-          display: "grid",
-          gridTemplateColumns: "1fr 1fr",
-          gridTemplateRows: "1fr 1fr",
-          gap: "2px",
-          background: "#1a1a1a",
-        }}
-      >
-        <div style={mprPanelWrapperStyle}>
-          {renderSinglePanel("100%", "100%", `Axial · ${currentSlice}/${maxSlices}`)}
+    if (isMprMode) {
+      return (
+        <div
+          style={{
+            width: w,
+            height: h,
+            display: "grid",
+            gridTemplateColumns: "1fr 1fr",
+            gridTemplateRows: "1fr 1fr",
+            gap: "2px",
+            background: "#1a1a1a",
+          }}
+        >
+          <div style={mprPanelWrapperStyle}>
+            {renderSinglePanel("100%", "100%", `Axial · ${currentSlice}/${maxSlices}`)}
+          </div>
+          <div style={mprPanelWrapperStyle}>{renderPlanePanel("coronal", "Coronal")}</div>
+          <div style={mprPanelWrapperStyle}>{renderPlanePanel("sagittal", "Sagittal")}</div>
+          <div style={mprPanelWrapperStyle}>{renderScoutPanel(false)}</div>
         </div>
-        <div style={mprPanelWrapperStyle}>{renderPlanePanel("coronal", "Coronal")}</div>
-        <div style={mprPanelWrapperStyle}>{renderPlanePanel("sagittal", "Sagittal")}</div>
-        <div style={mprPanelWrapperStyle}>{render3dPanel()}</div>
-      </div>
-    );
+      );
+    }
+
+    if (!study.dicom_path) return renderSinglePanel(w, h);
+
+    if (activeView === "coronal") return renderPlanePanel("coronal", "Coronal", true);
+    if (activeView === "sagittal") return renderPlanePanel("sagittal", "Sagittal", true);
+    if (activeView === "scout") {
+      return (
+        <div style={{ width: w, height: h }}>{renderScoutPanel(true)}</div>
+      );
+    }
+    return renderSinglePanel(w, h);
   };
 
   // ─── MOBILE LAYOUT ──────────────────────────────────────────────────────
@@ -1389,22 +1524,20 @@ export default function ViewerPage() {
             flexShrink: 0,
           }}
         >
-          {series.map((s, i) => (
+          {viewTabs.map((t) => (
             <button
-              key={i}
-              onClick={() => {
-                setActiveSeries(i);
-                setCurrentSlice(1);
-                setCoronalSlice(null);
-                setSagittalSlice(null);
-              }}
+              key={t.id}
+              disabled={t.disabled}
+              title={t.disabled ? "No scout/localizer image found in this study" : undefined}
+              onClick={() => selectView(t.id)}
               style={{
                 flexShrink: 0,
                 width: "60px",
                 background: "#111",
-                border: `2px solid ${i === activeSeries ? "#1A73E8" : "#2a2a2a"}`,
+                border: `2px solid ${t.id === activeView ? "#1A73E8" : "#2a2a2a"}`,
                 borderRadius: "8px",
-                cursor: "pointer",
+                cursor: t.disabled ? "not-allowed" : "pointer",
+                opacity: t.disabled ? 0.4 : 1,
                 padding: "4px",
                 display: "flex",
                 flexDirection: "column",
@@ -1425,12 +1558,12 @@ export default function ViewerPage() {
               <div
                 style={{
                   fontSize: "8px",
-                  color: i === activeSeries ? "#60a5fa" : "#6b7280",
+                  color: t.id === activeView ? "#60a5fa" : "#6b7280",
                   textAlign: "center",
                   lineHeight: 1.2,
                 }}
               >
-                {s.label}
+                {t.label}
               </div>
             </button>
           ))}
@@ -1459,12 +1592,12 @@ export default function ViewerPage() {
           </div>
           {renderMissingDicomBadge()}
 
-          {!!study.dicom_path && maxSlices > 1 && (
+          {!!study.dicom_path && !isMprMode && activeMaxSlices > 1 && (
             <SliceScrubber
-              currentSlice={currentSlice}
-              maxSlices={maxSlices}
-              onScrub={setCurrentSlice}
-              strip={localizerStrip}
+              currentSlice={activeCurrentSlice}
+              maxSlices={activeMaxSlices}
+              onScrub={setActiveCurrentSlice}
+              strip={activeView === "axial" ? localizerStrip : null}
             />
           )}
 
@@ -1504,7 +1637,7 @@ export default function ViewerPage() {
               >
                 <div>W: 80 L: 40</div>
                 <div>Zoom: {Math.round(zoom * 100)}%</div>
-                <div>Img: {currentSlice}/{maxSlices}</div>
+                <div>Img: {activeCurrentSlice}/{activeMaxSlices}</div>
               </div>
 
               <div
@@ -1534,12 +1667,12 @@ export default function ViewerPage() {
                 }}
               >
                 <div>Kenyatta National Hospital</div>
-                <div>{currentSeries.label}</div>
+                <div>{VIEW_LABELS[activeView]}</div>
               </div>
             </>
           )}
 
-          {maxSlices > 1 && (
+          {!isMprMode && activeMaxSlices > 1 && (
             <div
               style={{
                 position: "absolute",
@@ -1557,7 +1690,7 @@ export default function ViewerPage() {
               }}
             >
               <button
-                onClick={() => setCurrentSlice(Math.max(1, currentSlice - 1))}
+                onClick={() => setActiveCurrentSlice(Math.max(1, activeCurrentSlice - 1))}
                 style={{
                   background: "none",
                   border: "none",
@@ -1577,10 +1710,10 @@ export default function ViewerPage() {
                   textAlign: "center",
                 }}
               >
-                {currentSlice} / {maxSlices}
+                {activeCurrentSlice} / {activeMaxSlices}
               </span>
               <button
-                onClick={() => setCurrentSlice(Math.min(maxSlices, currentSlice + 1))}
+                onClick={() => setActiveCurrentSlice(Math.min(activeMaxSlices, activeCurrentSlice + 1))}
                 style={{
                   background: "none",
                   border: "none",
@@ -1905,53 +2038,55 @@ export default function ViewerPage() {
           >
             SERIES
           </div>
-          {series.map((s, i) => (
-            <button
-              key={i}
-              onClick={() => {
-                setActiveSeries(i);
-                setCurrentSlice(1);
-                setCoronalSlice(null);
-                setSagittalSlice(null);
-              }}
-              style={{
-                background: i === activeSeries ? "rgba(26,115,232,0.15)" : "transparent",
-                border: "none",
-                borderLeft: `3px solid ${i === activeSeries ? "#1A73E8" : "transparent"}`,
-                cursor: "pointer",
-                padding: "8px",
-                display: "flex",
-                flexDirection: "column",
-                alignItems: "center",
-                gap: "6px",
-              }}
-            >
-              <div
+          {viewTabs.map((t) => {
+            const count =
+              t.id === "axial" ? maxSlices : t.id === "coronal" ? coronalMax : t.id === "sagittal" ? sagittalMax : 1;
+            return (
+              <button
+                key={t.id}
+                disabled={t.disabled}
+                title={t.disabled ? "No scout/localizer image found in this study" : undefined}
+                onClick={() => selectView(t.id)}
                 style={{
-                  width: "120px",
-                  height: "90px",
-                  borderRadius: "6px",
-                  overflow: "hidden",
-                  background: "#111",
-                  border: `1px solid ${i === activeSeries ? "#1A73E8" : "#2a2a2a"}`,
+                  background: t.id === activeView ? "rgba(26,115,232,0.15)" : "transparent",
+                  border: "none",
+                  borderLeft: `3px solid ${t.id === activeView ? "#1A73E8" : "transparent"}`,
+                  cursor: t.disabled ? "not-allowed" : "pointer",
+                  opacity: t.disabled ? 0.4 : 1,
+                  padding: "8px",
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "center",
+                  gap: "6px",
                 }}
               >
-                {renderImage(study.modality, 1)}
-              </div>
-              <div style={{ textAlign: "center" }}>
                 <div
                   style={{
-                    fontSize: "11px",
-                    color: i === activeSeries ? "#93c5fd" : "#d1d5db",
-                    fontWeight: 600,
+                    width: "120px",
+                    height: "90px",
+                    borderRadius: "6px",
+                    overflow: "hidden",
+                    background: "#111",
+                    border: `1px solid ${t.id === activeView ? "#1A73E8" : "#2a2a2a"}`,
                   }}
                 >
-                  {s.label}
+                  {renderImage(study.modality, 1)}
                 </div>
-                <div style={{ fontSize: "10px", color: "#4b5563" }}>{s.count} imgs</div>
-              </div>
-            </button>
-          ))}
+                <div style={{ textAlign: "center" }}>
+                  <div
+                    style={{
+                      fontSize: "11px",
+                      color: t.id === activeView ? "#93c5fd" : "#d1d5db",
+                      fontWeight: 600,
+                    }}
+                  >
+                    {t.label}
+                  </div>
+                  <div style={{ fontSize: "10px", color: "#4b5563" }}>{count} imgs</div>
+                </div>
+              </button>
+            );
+          })}
         </div>
 
         {/* Main viewport */}
@@ -1979,12 +2114,12 @@ export default function ViewerPage() {
           </div>
           {renderMissingDicomBadge()}
 
-          {!!study.dicom_path && maxSlices > 1 && (
+          {!!study.dicom_path && !isMprMode && activeMaxSlices > 1 && (
             <SliceScrubber
-              currentSlice={currentSlice}
-              maxSlices={maxSlices}
-              onScrub={setCurrentSlice}
-              strip={localizerStrip}
+              currentSlice={activeCurrentSlice}
+              maxSlices={activeMaxSlices}
+              onScrub={setActiveCurrentSlice}
+              strip={activeView === "axial" ? localizerStrip : null}
               rightOffset="64px"
             />
           )}
@@ -2026,8 +2161,8 @@ export default function ViewerPage() {
               >
                 <div>W: 80 L: 40</div>
                 <div>Zoom: {Math.round(zoom * 100)}%</div>
-                <div>Img: {currentSlice} / {maxSlices}</div>
-                <div style={{ color: "#6b7280" }}>{currentSeries.label}</div>
+                <div>Img: {activeCurrentSlice} / {activeMaxSlices}</div>
+                <div style={{ color: "#6b7280" }}>{VIEW_LABELS[activeView]}</div>
               </div>
 
               <div
@@ -2061,12 +2196,12 @@ export default function ViewerPage() {
                 }}
               >
                 <div>{study.institution}</div>
-                <div>Series: {currentSeries.label}</div>
+                <div>Series: {VIEW_LABELS[activeView]}</div>
               </div>
             </>
           )}
 
-          {maxSlices > 1 && (
+          {!isMprMode && activeMaxSlices > 1 && (
             <div
               style={{
                 position: "absolute",
@@ -2085,7 +2220,7 @@ export default function ViewerPage() {
               }}
             >
               <button
-                onClick={() => setCurrentSlice(Math.max(1, currentSlice - 1))}
+                onClick={() => setActiveCurrentSlice(Math.max(1, activeCurrentSlice - 1))}
                 style={{ background: "none", border: "none", color: "#9ca3af", cursor: "pointer" }}
               >
                 <ChevronLeft size={18} />
@@ -2099,10 +2234,10 @@ export default function ViewerPage() {
                   textAlign: "center",
                 }}
               >
-                {currentSlice} / {maxSlices}
+                {activeCurrentSlice} / {activeMaxSlices}
               </span>
               <button
-                onClick={() => setCurrentSlice(Math.min(maxSlices, currentSlice + 1))}
+                onClick={() => setActiveCurrentSlice(Math.min(activeMaxSlices, activeCurrentSlice + 1))}
                 style={{ background: "none", border: "none", color: "#9ca3af", cursor: "pointer" }}
               >
                 <ChevronRight size={18} />

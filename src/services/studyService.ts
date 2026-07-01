@@ -56,6 +56,7 @@ export interface SeriesInfo {
   count: number;
   modality: string;
   description: string;
+  is_scout: boolean;
 }
 
 export interface StudySeriesResponse {
