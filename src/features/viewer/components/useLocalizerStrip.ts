@@ -42,11 +42,23 @@ function previewUrl(studyId: string, filename: string): string {
   return `/api/v1/studies/${studyId}/dicom/${encodeURIComponent(filename)}/preview`;
 }
 
-function loadImage(src: string): Promise<HTMLImageElement> {
+// Registering the in-flight <img> lets a cancelled load actually be
+// aborted (.src = "" stops the network request) instead of just having its
+// result discarded — otherwise a stale series' fetches keep running in the
+// background after switching, competing for bandwidth with the new one.
+function loadImage(src: string, inFlight: Set<HTMLImageElement>): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const img = new Image();
-    img.onload = () => resolve(img);
-    img.onerror = () => reject(new Error(`Failed to load ${src}`));
+    inFlight.add(img);
+    const done = () => inFlight.delete(img);
+    img.onload = () => {
+      done();
+      resolve(img);
+    };
+    img.onerror = () => {
+      done();
+      reject(new Error(`Failed to load ${src}`));
+    };
     img.src = src;
   });
 }
@@ -62,6 +74,7 @@ export function useLocalizerStrip(
     loading: false,
   });
   const cancelledRef = useRef(false);
+  const inFlightRef = useRef<Set<HTMLImageElement>>(new Set());
 
   useEffect(() => {
     if (!enabled || !studyId) return;
@@ -74,6 +87,7 @@ export function useLocalizerStrip(
     }
 
     cancelledRef.current = false;
+    const inFlight = inFlightRef.current;
     setState({ strip: null, loading: true });
 
     (async () => {
@@ -102,7 +116,7 @@ export function useLocalizerStrip(
 
         for (let i = 0; i < sampleIndices.length; i++) {
           if (cancelledRef.current) return;
-          const img = await loadImage(previewUrl(studyId, files[sampleIndices[i]]));
+          const img = await loadImage(previewUrl(studyId, files[sampleIndices[i]]), inFlight);
           const w = img.naturalWidth || 1;
           const h = img.naturalHeight || 1;
           if (!pixels) {
@@ -134,6 +148,12 @@ export function useLocalizerStrip(
 
     return () => {
       cancelledRef.current = true;
+      for (const img of inFlight) {
+        img.onload = null;
+        img.onerror = null;
+        img.src = "";
+      }
+      inFlight.clear();
     };
   }, [studyId, activeSeries, seriesCount, enabled]);
 

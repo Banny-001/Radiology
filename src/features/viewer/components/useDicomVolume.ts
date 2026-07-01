@@ -54,11 +54,26 @@ function previewUrl(studyId: string, filename: string): string {
   return `/api/v1/studies/${studyId}/dicom/${encodeURIComponent(filename)}/preview`;
 }
 
-function loadImage(src: string): Promise<HTMLImageElement> {
+// Registering every in-flight <img> lets a cancelled load actually be
+// aborted (setting .src = "" stops the underlying network request) instead
+// of just having its result ignored. Without this, switching series (or
+// toggling MPR off/on) while a volume is still loading left the old
+// series' downloads running in the background, competing for bandwidth
+// with the new series' fetches — which is why re-loading felt so much
+// slower than it should have.
+function loadImage(src: string, inFlight: Set<HTMLImageElement>): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const img = new Image();
-    img.onload = () => resolve(img);
-    img.onerror = () => reject(new Error(`Failed to load ${src}`));
+    inFlight.add(img);
+    const done = () => inFlight.delete(img);
+    img.onload = () => {
+      done();
+      resolve(img);
+    };
+    img.onerror = () => {
+      done();
+      reject(new Error(`Failed to load ${src}`));
+    };
     img.src = src;
   });
 }
@@ -81,6 +96,7 @@ export function useDicomVolume(
     error: null,
   });
   const cancelledRef = useRef(false);
+  const inFlightRef = useRef<Set<HTMLImageElement>>(new Set());
 
   useEffect(() => {
     if (!enabled || !studyId) return;
@@ -93,6 +109,7 @@ export function useDicomVolume(
     }
 
     cancelledRef.current = false;
+    const inFlight = inFlightRef.current;
     setState({ volume: null, loading: true, progress: 0, error: null });
 
     (async () => {
@@ -105,7 +122,7 @@ export function useDicomVolume(
 
         // First slice establishes the in-plane dimensions for the volume,
         // scaled down to MAX_VOLUME_DIM on the longer edge.
-        const firstImg = await loadImage(previewUrl(studyId, files[0]));
+        const firstImg = await loadImage(previewUrl(studyId, files[0]), inFlight);
         const nativeWidth = firstImg.naturalWidth || 1;
         const nativeHeight = firstImg.naturalHeight || 1;
         const scale = Math.min(1, MAX_VOLUME_DIM / Math.max(nativeWidth, nativeHeight));
@@ -157,7 +174,7 @@ export function useDicomVolume(
           while (!cancelledRef.current) {
             const z = nextIndex++;
             if (z >= depth) return;
-            const img = await loadImage(previewUrl(studyId, files[z]));
+            const img = await loadImage(previewUrl(studyId, files[z]), inFlight);
             if (cancelledRef.current) return;
             writeSlice(img, z);
             reportProgress(z);
@@ -185,6 +202,12 @@ export function useDicomVolume(
 
     return () => {
       cancelledRef.current = true;
+      for (const img of inFlight) {
+        img.onload = null;
+        img.onerror = null;
+        img.src = ""; // actually aborts the pending network request
+      }
+      inFlight.clear();
     };
   }, [studyId, activeSeries, seriesCount, enabled]);
 
