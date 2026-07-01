@@ -51,6 +51,17 @@ export interface DicomFileListResponse {
   files: string[];
 }
 
+export interface SeriesInfo {
+  index: number;
+  count: number;
+  modality: string;
+  description: string;
+}
+
+export interface StudySeriesResponse {
+  series: SeriesInfo[];
+}
+
 // ─── Typed API error ──────────────────────────────────────────────────────────
 
 export class ApiError extends Error {
@@ -148,11 +159,13 @@ function dedupe<T>(key: string, fn: () => Promise<T>): Promise<T> {
 const studyListCache = new TtlCache<StudyListOut>();
 const studyCache = new TtlCache<StudyOut>();
 const fileListCache = new TtlCache<string[]>();
+const seriesInfoCache = new TtlCache<SeriesInfo[]>();
 
 const TTL = {
   studyList: 30_000,
   study: 60_000,
   fileList: 5 * 60_000,
+  seriesInfo: 5 * 60_000,
 } as const;
 
 // ─── ZIP helper ───────────────────────────────────────────────────────────────
@@ -336,20 +349,44 @@ export function getStudy(studyId: string): Promise<StudyOut> {
   });
 }
 
-export function getDicomFileList(studyId: string): Promise<string[]> {
-  const cacheKey = `files:${studyId}`;
+// `series` selects one of the study's real DICOM series (see
+// /studies/{id}/series — largest-first, 0 = default/primary), not an
+// arbitrary equal-count chunk. Each series gets its own cache entry since
+// they're genuinely different file sets now.
+export function getDicomFileList(studyId: string, series: number = 0): Promise<string[]> {
+  const cacheKey = `files:${studyId}:${series}`;
   const cached = fileListCache.get(cacheKey);
   if (cached) return Promise.resolve(cached);
 
   return dedupe(cacheKey, async () => {
     const data = await apiFetch<DicomFileListResponse>(
-      `${BASE}/studies/${studyId}/files`,
+      `${BASE}/studies/${studyId}/files?series=${series}`,
       undefined,
       2,
     );
     const files = (data.files ?? []).filter((f: string) => f !== "DICOMDIR");
     fileListCache.set(cacheKey, files, TTL.fileList);
     return files;
+  });
+}
+
+// The real series list for the sidebar (largest-first). Replaces the old
+// static per-modality placeholder labels, which were generic copy
+// unrelated to what was actually uploaded.
+export function getStudySeries(studyId: string): Promise<SeriesInfo[]> {
+  const cacheKey = `series:${studyId}`;
+  const cached = seriesInfoCache.get(cacheKey);
+  if (cached) return Promise.resolve(cached);
+
+  return dedupe(cacheKey, async () => {
+    const data = await apiFetch<StudySeriesResponse>(
+      `${BASE}/studies/${studyId}/series`,
+      undefined,
+      2,
+    );
+    const series = data.series ?? [];
+    seriesInfoCache.set(cacheKey, series, TTL.seriesInfo);
+    return series;
   });
 }
 
@@ -364,11 +401,13 @@ export const prefetchDicomFileList = (studyId: string) =>
 export function invalidateStudyCache(studyId?: string): void {
   if (studyId) {
     studyCache.delete(`study:${studyId}`);
-    fileListCache.delete(`files:${studyId}`);
+    fileListCache.invalidatePrefix(`files:${studyId}`);
+    seriesInfoCache.delete(`series:${studyId}`);
     studyListCache.invalidatePrefix("studies:");
   } else {
     studyCache.clear();
     fileListCache.clear();
+    seriesInfoCache.clear();
     studyListCache.clear();
   }
 }

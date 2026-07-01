@@ -25,19 +25,6 @@ interface LocalizerStripState {
 const MAX_SAMPLES = 40;
 const stripCache = new Map<string, LocalizerStrip>();
 
-function partitionBySeries(
-  fileList: string[],
-  activeSeries: number,
-  seriesCount: number,
-): string[] {
-  if (fileList.length === 0 || seriesCount <= 1) return fileList;
-  const chunkSize = Math.max(1, Math.floor(fileList.length / seriesCount));
-  const start = activeSeries * chunkSize;
-  const end =
-    activeSeries === seriesCount - 1 ? fileList.length : start + chunkSize;
-  return fileList.slice(start, end);
-}
-
 function previewUrl(studyId: string, filename: string): string {
   return `/api/v1/studies/${studyId}/dicom/${encodeURIComponent(filename)}/preview`;
 }
@@ -66,7 +53,6 @@ function loadImage(src: string, inFlight: Set<HTMLImageElement>): Promise<HTMLIm
 export function useLocalizerStrip(
   studyId: string,
   activeSeries: number,
-  seriesCount: number,
   enabled: boolean,
 ): LocalizerStripState {
   const [state, setState] = useState<LocalizerStripState>({
@@ -79,7 +65,7 @@ export function useLocalizerStrip(
   useEffect(() => {
     if (!enabled || !studyId) return;
 
-    const cacheKey = `${studyId}:${activeSeries}:${seriesCount}`;
+    const cacheKey = `${studyId}:${activeSeries}`;
     const cached = stripCache.get(cacheKey);
     if (cached) {
       setState({ strip: cached, loading: false });
@@ -92,8 +78,9 @@ export function useLocalizerStrip(
 
     (async () => {
       try {
-        const fileList = await getDicomFileList(studyId);
-        const files = partitionBySeries(fileList, activeSeries, seriesCount);
+        // The backend already groups files by real DICOM series (see
+        // /studies/{id}/files?series=N) — no client-side re-chunking needed.
+        const files = await getDicomFileList(studyId, activeSeries);
         if (files.length === 0) {
           setState({ strip: null, loading: false });
           return;
@@ -155,7 +142,7 @@ export function useLocalizerStrip(
       }
       inFlight.clear();
     };
-  }, [studyId, activeSeries, seriesCount, enabled]);
+  }, [studyId, activeSeries, enabled]);
 
   return state;
 }

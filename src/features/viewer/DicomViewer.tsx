@@ -20,8 +20,9 @@ interface DicomViewerProps {
   imageIndex?: number;
   offsetX?: number;
   offsetY?: number;
+  /** Index into the study's real DICOM series list (see
+   * /studies/{id}/series — largest-first, 0 = default/primary). */
   activeSeries?: number;
-  seriesCount?: number;
   onFileCountChange?: (count: number) => void;
   onImageIndexChange?: (index: number) => void;
   /** Skip the full-series background prefetch below. Set this while MPR
@@ -40,24 +41,16 @@ export default function DicomViewer({
   offsetX = 0,
   offsetY = 0,
   activeSeries = 0,
-  seriesCount = 1,
   onFileCountChange,
   suppressBackgroundPrefetch = false,
 }: DicomViewerProps) {
-  const [fileList, setFileList] = useState<string[]>([]);
+  // This IS the active series' file list already — the backend groups by
+  // real DICOM series (see /studies/{id}/files?series=N), so no further
+  // client-side chunking is needed or correct here.
+  const [seriesFileList, setFileList] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   // Track which study+series has already started prefetching so we don't repeat
   const prefetchKeyRef = useRef<string | null>(null);
-
-  // ── Series partitioning ────────────────────────────────────────────────
-  const seriesFileList = (() => {
-    if (fileList.length === 0 || seriesCount <= 1) return fileList;
-    const chunkSize = Math.max(1, Math.floor(fileList.length / seriesCount));
-    const start = activeSeries * chunkSize;
-    const end =
-      activeSeries === seriesCount - 1 ? fileList.length : start + chunkSize;
-    return fileList.slice(start, end);
-  })();
 
   const safeIndex =
     seriesFileList.length > 0
@@ -66,17 +59,19 @@ export default function DicomViewer({
 
   const currentFile = seriesFileList[safeIndex];
 
-  // ── Fetch file list once ───────────────────────────────────────────────
+  // ── Fetch this series' file list ────────────────────────────────────────
   useEffect(() => {
-    getDicomFileList(studyId)
+    setFileList([]);
+    setError(null);
+    getDicomFileList(studyId, activeSeries)
       .then((files) => {
         setFileList(files);
-        if (files.length === 0) setError("No DICOM files found in this study");
+        if (files.length === 0) setError("No DICOM files found in this series");
       })
       .catch((err) =>
         setError(`Failed to load file list:\n${(err as Error).message}`),
       );
-  }, [studyId]);
+  }, [studyId, activeSeries]);
 
   // ── Report per-series count to parent (drives slice counter in ViewerPage)
   useEffect(() => {

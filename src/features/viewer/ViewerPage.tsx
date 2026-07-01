@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 import { useStudies } from "../../context/StudyContext";
 import { useAuth } from "../../context/AuthContext";
+import { getStudySeries, type SeriesInfo } from "../../services/studyService";
 import { SERIES_MAP, TOOLS } from "./components/viewerConstants";
 import { renderImage } from "./components/medicalImages";
 import { StudyInfoPanel } from "./components/StudyInfoPanel";
@@ -47,6 +48,43 @@ export default function ViewerPage() {
   const { user } = useAuth();
 
   const study = studies.find((s) => s.id === id);
+
+  // ── Real DICOM series list ────────────────────────────────────────────
+  // Replaces the old SERIES_MAP placeholder (generic per-modality labels
+  // completely unrelated to what was actually uploaded). The backend now
+  // groups the uploaded folder by real SeriesInstanceUID (see
+  // /studies/{id}/series in studies.py), largest series first, so each
+  // sidebar tab corresponds to an actual distinct series and switching
+  // tabs fetches/reconstructs that real series' files.
+  const [realSeries, setRealSeries] = useState<SeriesInfo[] | null>(null);
+  useEffect(() => {
+    if (!study?.id || !study.dicom_path) {
+      setRealSeries(null);
+      return;
+    }
+    let cancelled = false;
+    getStudySeries(study.id)
+      .then((list) => {
+        if (!cancelled) setRealSeries(list);
+      })
+      .catch(() => {
+        if (!cancelled) setRealSeries(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [study?.id, study?.dicom_path]);
+
+  // Real series list for the sidebar tabs, falling back to the old generic
+  // per-modality placeholder only when there's no real uploaded DICOM data
+  // (e.g. a demo study) or the /series call hasn't resolved yet.
+  const series =
+    realSeries && realSeries.length > 0
+      ? realSeries.map((s, i) => ({
+          label: s.description || (s.modality ? s.modality : `Series ${i + 1}`),
+          count: s.count,
+        }))
+      : (study ? (SERIES_MAP[study.modality] ?? SERIES_MAP.CT) : SERIES_MAP.CT);
 
   const [activeSeries, setActiveSeries] = useState(0);
   const [currentSlice, setCurrentSlice] = useState(1);
@@ -91,17 +129,12 @@ export default function ViewerPage() {
   const [coronalSlice, setCoronalSlice] = useState<number | null>(null);
   const [sagittalSlice, setSagittalSlice] = useState<number | null>(null);
 
-  // The backend's /files endpoint now returns only the study's primary
-  // real DICOM series (see _primary_series_files in studies.py) — the
-  // exact same file set the MPR volume is built from. Previously the
-  // frontend re-chunked that list again into N arbitrary equal pieces (one
-  // per fake sidebar "series" tab), which meant the axial pane and the
-  // MPR volume could end up scrolling through *different* file subsets —
-  // that's what made a given "slice N" show a different physical position
-  // in the axial pane than in the coronal/sagittal/MIP panes. Passing
-  // seriesCount=1 everywhere disables that re-chunking so every view reads
-  // the same, already-correct list.
-  const seriesCountForVolume = 1;
+  // The backend's /files, /mpr/* and /series endpoints all key off the same
+  // real per-series grouping now (see _all_series_groups in studies.py), so
+  // whichever series tab is active, the axial pane, the MPR volume, and the
+  // sidebar all agree on the same file set — no more client-side chunking
+  // that could disagree with what the server actually used.
+  const seriesCountForVolume = series.length;
   // The volume itself is now built server-side (see studies.py /mpr/*) from
   // raw DICOM pixel data, cached in memory per study — this hook only
   // fetches the resulting dimensions, not hundreds of slice images.
@@ -120,7 +153,6 @@ export default function ViewerPage() {
   const { strip: localizerStrip } = useLocalizerStrip(
     study?.id ?? "",
     activeSeries,
-    seriesCountForVolume,
     !!study?.dicom_path,
   );
 
@@ -141,9 +173,7 @@ export default function ViewerPage() {
   const sagittalMaxRef = useRef(sagittalMax);
   sagittalMaxRef.current = sagittalMax;
 
-  const placeholderMaxSlices = study
-    ? ((SERIES_MAP[study.modality] ?? SERIES_MAP.CT)[activeSeries]?.count ?? 1)
-    : 1;
+  const placeholderMaxSlices = series[activeSeries]?.count ?? series[0]?.count ?? 1;
   const maxSlicesForTouch =
     dicomFileCount > 0 ? dicomFileCount : placeholderMaxSlices;
   const maxSlicesRef = useRef(maxSlicesForTouch);
@@ -453,8 +483,7 @@ export default function ViewerPage() {
     );
   }
 
-  const series = SERIES_MAP[study.modality] ?? SERIES_MAP.CT;
-  const currentSeries = series[activeSeries];
+  const currentSeries = series[activeSeries] ?? series[0];
   const maxSlices = dicomFileCount > 0 ? dicomFileCount : currentSeries.count;
 
   const TOOLS_PER_PAGE = isMobile ? 8 : TOOLS.length;
@@ -855,7 +884,6 @@ export default function ViewerPage() {
           offsetX={offset.x}
           offsetY={offset.y}
           activeSeries={activeSeries}
-          seriesCount={1}
           onFileCountChange={setDicomFileCount}
         />
       </div>
@@ -1364,14 +1392,7 @@ export default function ViewerPage() {
           {series.map((s, i) => (
             <button
               key={i}
-              disabled={isMprMode && i !== activeSeries}
-              title={
-                isMprMode && i !== activeSeries
-                  ? "MPR reconstructs the study's primary series — switch series after turning MPR off"
-                  : undefined
-              }
               onClick={() => {
-                if (isMprMode && i !== activeSeries) return;
                 setActiveSeries(i);
                 setCurrentSlice(1);
                 setCoronalSlice(null);
@@ -1383,8 +1404,7 @@ export default function ViewerPage() {
                 background: "#111",
                 border: `2px solid ${i === activeSeries ? "#1A73E8" : "#2a2a2a"}`,
                 borderRadius: "8px",
-                cursor: isMprMode && i !== activeSeries ? "not-allowed" : "pointer",
-                opacity: isMprMode && i !== activeSeries ? 0.4 : 1,
+                cursor: "pointer",
                 padding: "4px",
                 display: "flex",
                 flexDirection: "column",
@@ -1888,14 +1908,7 @@ export default function ViewerPage() {
           {series.map((s, i) => (
             <button
               key={i}
-              disabled={isMprMode && i !== activeSeries}
-              title={
-                isMprMode && i !== activeSeries
-                  ? "MPR reconstructs the study's primary series — switch series after turning MPR off"
-                  : undefined
-              }
               onClick={() => {
-                if (isMprMode && i !== activeSeries) return;
                 setActiveSeries(i);
                 setCurrentSlice(1);
                 setCoronalSlice(null);
@@ -1905,8 +1918,7 @@ export default function ViewerPage() {
                 background: i === activeSeries ? "rgba(26,115,232,0.15)" : "transparent",
                 border: "none",
                 borderLeft: `3px solid ${i === activeSeries ? "#1A73E8" : "transparent"}`,
-                cursor: isMprMode && i !== activeSeries ? "not-allowed" : "pointer",
-                opacity: isMprMode && i !== activeSeries ? 0.4 : 1,
+                cursor: "pointer",
                 padding: "8px",
                 display: "flex",
                 flexDirection: "column",

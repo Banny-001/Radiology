@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -210,6 +211,48 @@ def _dicom_to_jpeg(
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=quality, optimize=True)
     return buf.getvalue()
+
+
+# ── In-memory preview cache ──────────────────────────────────────────────
+#
+# The browser's 24h Cache-Control header avoids re-fetching a slice within
+# one tab, but every *first* view of a slice — the initial background
+# prefetch of a whole series, a second browser tab, a page reload, or a
+# request landing on the other uvicorn worker — still pays the full
+# dcmread + windowing + JPEG-encode cost from scratch. That decode is the
+# actual CPU-bound part of "loading" a slice, so caching the finished JPEG
+# bytes here (keyed by file + mtime + the exact params used) makes every
+# request after the first one for a given slice effectively instant,
+# independent of the browser cache. Bounded + LRU-evicted so a huge study
+# can't grow this without limit.
+_PREVIEW_CACHE: "collections.OrderedDict[tuple, bytes]" = collections.OrderedDict()
+_PREVIEW_CACHE_MAX = 1024  # ~1024 × ~40 KB ≈ 40 MB ceiling, per uvicorn worker
+_PREVIEW_CACHE_LOCK = threading.Lock()
+
+
+def _cached_dicom_to_jpeg(
+    file_path: str,
+    mtime: float,
+    wc: float | None,
+    ww: float | None,
+    quality: int,
+    folder: str | None,
+) -> bytes:
+    cache_key = (file_path, mtime, wc, ww, quality)
+    with _PREVIEW_CACHE_LOCK:
+        cached = _PREVIEW_CACHE.get(cache_key)
+        if cached is not None:
+            _PREVIEW_CACHE.move_to_end(cache_key)
+            return cached
+
+    result = _dicom_to_jpeg(file_path, wc, ww, quality, folder)
+
+    with _PREVIEW_CACHE_LOCK:
+        _PREVIEW_CACHE[cache_key] = result
+        _PREVIEW_CACHE.move_to_end(cache_key)
+        while len(_PREVIEW_CACHE) > _PREVIEW_CACHE_MAX:
+            _PREVIEW_CACHE.popitem(last=False)
+    return result
 
 
 # ── Image → DICOM conversion ─────────────────────────────────────────────
@@ -465,7 +508,7 @@ def _sorted_dicom_files(folder: str) -> list[str]:
 # resulting pixel values (e.g. the windowing fix below) — included in the
 # cache key so a stale on-disk/in-memory volume built under the old logic
 # never gets served just because the DICOM folder itself hasn't changed.
-_VOLUME_CACHE_VERSION = 5
+_VOLUME_CACHE_VERSION = 6
 _VOLUME_MAX_DIM = 384  # bumped from 320 for sharper coronal/sagittal/MIP detail
 # Now that MPR uses the whole primary series (previously it was an
 # arbitrary ~1/4 chunk of the folder), a single series can be 500-1000+
@@ -499,45 +542,97 @@ def _volume_locks_guard() -> asyncio.Lock:
     return _VOLUME_LOCKS_GUARD
 
 
-def _primary_series_files(folder: str) -> list[str]:
-    """The single, coherent set of files MPR should be built from.
+class SeriesGroup:
+    __slots__ = ("uid", "files", "modality", "description")
 
-    MPR needs ONE real volumetric acquisition. The upload folder can (and
-    here, does) contain several distinct real DICOM series mixed together —
-    a genuine axial CT run, a scout/localizer, sometimes other reformats —
-    and naively splitting the whole flat file list into N equal chunks
-    (which is what the sidebar's generic "Axial Brain / Coronal / Sagittal
-    / Scout" labels implied should happen) interleaves slices from
-    different series/orientations whenever a chunk boundary doesn't line
-    up with a real series boundary. Stacked for MPR, that produces
-    non-anatomical banding — exactly what real per-series InstanceNumber
-    sequences restarting at 1 for each series would cause under a single
-    folder-wide sort. Grouping by the actual SeriesInstanceUID and taking
-    the largest group (reliably the true volumetric run, not the 1-frame
-    scout or a handful of secondary captures) is what a real DICOM viewer
-    does, and is what fixes this at the root instead of patching symptoms.
+    def __init__(self, uid: str, files: list[str], modality: str, description: str):
+        self.uid = uid
+        self.files = files
+        self.modality = modality
+        self.description = description
+
+
+# Per-process cache of the grouped series list, same mtime-invalidation
+# scheme as the other folder-derived caches — grouping requires reading
+# every file's header, which isn't free for a few hundred files.
+_SERIES_GROUPS_CACHE: dict[str, tuple[float, list[SeriesGroup]]] = {}
+
+
+def _all_series_groups(folder: str) -> list[SeriesGroup]:
+    """Every real DICOM series in the folder, sorted largest-first.
+
+    The upload folder can (and often does) contain several distinct real
+    DICOM series mixed together — a genuine axial CT run, a scout/
+    localizer, sometimes other reformats — all as one flat file dump.
+    Naively splitting that flat list into N equal chunks (which is what the
+    sidebar's generic "Axial Brain / Coronal / Sagittal / Scout" labels
+    used to imply) interleaves slices from different series/orientations
+    whenever a chunk boundary doesn't line up with a real series boundary —
+    non-anatomical banding when stacked for MPR, and a "series" tab that
+    shows an arbitrary, meaningless slice range for plain browsing. This
+    groups by the actual SeriesInstanceUID instead, so each sidebar entry
+    corresponds to a real, coherent series — index 0 is always the largest
+    (the true volumetric run, not the 1-frame scout or a handful of
+    secondary captures), matching what MPR reconstructs by default.
     """
+    try:
+        dir_mtime = os.path.getmtime(folder)
+    except OSError:
+        dir_mtime = 0.0
+    cached = _SERIES_GROUPS_CACHE.get(folder)
+    if cached and cached[0] == dir_mtime:
+        return cached[1]
+
     files = _sorted_dicom_files(folder)
     if not files:
-        return files
+        _SERIES_GROUPS_CACHE[folder] = (dir_mtime, [])
+        return []
 
+    order = {f: i for i, f in enumerate(files)}
     groups: dict[str, list[str]] = collections.defaultdict(list)
+    meta: dict[str, tuple[str, str]] = {}
     for f in files:
+        uid = "unknown"
+        modality = ""
+        description = ""
         try:
             ds = dcmread(os.path.join(folder, f), stop_before_pixels=True, force=True)
             uid = str(getattr(ds, "SeriesInstanceUID", "") or "unknown")
+            modality = str(getattr(ds, "Modality", "") or "")
+            description = str(getattr(ds, "SeriesDescription", "") or "")
         except Exception:
-            uid = "unknown"
+            pass
         groups[uid].append(f)
+        meta.setdefault(uid, (modality, description))
 
-    if len(groups) <= 1:
-        return files
+    result: list[SeriesGroup] = []
+    for uid, group_files in groups.items():
+        group_files.sort(key=lambda f: order[f])
+        modality, description = meta.get(uid, ("", ""))
+        result.append(SeriesGroup(uid, group_files, modality, description))
+    result.sort(key=lambda g: len(g.files), reverse=True)
 
-    primary_uid = max(groups, key=lambda uid: len(groups[uid]))
-    order = {f: i for i, f in enumerate(files)}
-    primary_files = groups[primary_uid]
-    primary_files.sort(key=lambda f: order[f])
-    return primary_files
+    _SERIES_GROUPS_CACHE[folder] = (dir_mtime, result)
+    return result
+
+
+def _primary_series_files(folder: str) -> list[str]:
+    """The single, coherent set of files MPR reconstructs from by default —
+    the largest real series (see _all_series_groups)."""
+    groups = _all_series_groups(folder)
+    return groups[0].files if groups else []
+
+
+def _series_files_by_index(folder: str, index: int) -> list[str]:
+    """Files for one specific real series, by its position in the
+    largest-first list (0 = primary/default). Clamped to a valid index so
+    an out-of-range tab selection degrades to the primary series instead of
+    erroring."""
+    groups = _all_series_groups(folder)
+    if not groups:
+        return []
+    index = max(0, min(len(groups) - 1, index))
+    return groups[index].files
 
 
 def _subsample_depth(files: list[str], max_depth: int) -> list[str]:
@@ -587,20 +682,22 @@ def _volume_cache_dir(folder: str) -> str:
     return d
 
 
-def _volume_cache_path(folder: str, mtime: float) -> str:
-    # One volume per study (the primary series), not per sidebar tab —
-    # series/series_count no longer change which files get reconstructed,
-    # so keying by them would just rebuild the same volume redundantly.
-    return os.path.join(_volume_cache_dir(folder), f"vol_v{_VOLUME_CACHE_VERSION}_{int(mtime)}.npy")
+def _volume_cache_path(folder: str, series: int, mtime: float) -> str:
+    # One volume per (study, real series index) — switching the sidebar tab
+    # now genuinely selects a different real series, so each needs its own
+    # cache entry rather than sharing one.
+    return os.path.join(
+        _volume_cache_dir(folder), f"vol_v{_VOLUME_CACHE_VERSION}_s{series}_{int(mtime)}.npy"
+    )
 
 
-def _load_volume_from_disk(folder: str, mtime: float) -> np.ndarray | None:
+def _load_volume_from_disk(folder: str, series: int, mtime: float) -> np.ndarray | None:
     """Runs with 2 uvicorn workers, and the in-memory _VOLUME_CACHE is
     per-process — if a request lands on the worker that didn't build the
     volume, it would otherwise redo the full multi-second DICOM read+decode
     pass from scratch. A small on-disk .npy cache lets it just load the
     array instead (milliseconds), and also survives a backend restart."""
-    path = _volume_cache_path(folder, mtime)
+    path = _volume_cache_path(folder, series, mtime)
     if os.path.isfile(path):
         try:
             return np.load(path)
@@ -609,11 +706,11 @@ def _load_volume_from_disk(folder: str, mtime: float) -> np.ndarray | None:
     return None
 
 
-def _save_volume_to_disk(folder: str, mtime: float, volume: np.ndarray) -> None:
+def _save_volume_to_disk(folder: str, series: int, mtime: float, volume: np.ndarray) -> None:
     try:
         cache_dir = _volume_cache_dir(folder)
-        current_name = f"vol_v{_VOLUME_CACHE_VERSION}_{int(mtime)}.npy"
-        prefix = f"vol_v{_VOLUME_CACHE_VERSION}_"
+        current_name = f"vol_v{_VOLUME_CACHE_VERSION}_s{series}_{int(mtime)}.npy"
+        prefix = f"vol_v{_VOLUME_CACHE_VERSION}_s{series}_"
         for fname in os.listdir(cache_dir):
             if fname.startswith(prefix) and fname != current_name:
                 try:
@@ -680,17 +777,19 @@ def _build_volume(folder: str, files: list[str]) -> np.ndarray:
 
 
 async def _get_volume(folder: str, series: int, series_count: int) -> np.ndarray:
-    """Cached per folder (invalidated on folder mtime change), one volume
-    per study regardless of which sidebar tab is active — see
-    _primary_series_files for why `series`/`series_count` no longer affect
-    which files get reconstructed. Kept as parameters only so the endpoint
-    call sites below don't need to change. A per-key asyncio.Lock ensures
-    that when MPR mode turns on and meta/coronal/sagittal/mip are all
-    requested at once on a cold cache, only one of them actually builds the
-    volume — the rest just wait on the same build instead of each redoing
-    it."""
-    del series, series_count  # no longer used for file selection — see above
-    key = f"v{_VOLUME_CACHE_VERSION}|{folder}"
+    """Cached per (folder, real series index), invalidated on folder mtime
+    change. `series` now selects one of the real DICOM series returned by
+    _all_series_groups (largest-first; 0 = default/primary) — the same
+    index the axial /files endpoint uses, so switching the sidebar tab
+    switches MPR to that same real series too. `series_count` is accepted
+    but unused; it was only ever meaningful for the old arbitrary-equal-
+    chunk scheme. A per-key asyncio.Lock ensures that when MPR mode turns
+    on and meta/coronal/sagittal/mip are all requested at once on a cold
+    cache, only one of them actually builds the volume — the rest just
+    wait on the same build instead of each redoing it.
+    """
+    del series_count  # unused — see above
+    key = f"v{_VOLUME_CACHE_VERSION}|{folder}|{series}"
     try:
         dir_mtime = os.path.getmtime(folder)
     except OSError:
@@ -712,18 +811,22 @@ async def _get_volume(folder: str, series: int, series_count: int) -> np.ndarray
             return cached[1]
 
         loop = asyncio.get_event_loop()
-        disk_volume = await loop.run_in_executor(None, _load_volume_from_disk, folder, dir_mtime)
+        disk_volume = await loop.run_in_executor(None, _load_volume_from_disk, folder, series, dir_mtime)
         if disk_volume is not None:
             _VOLUME_CACHE[key] = (dir_mtime, disk_volume)
             return disk_volume
 
-        files = await loop.run_in_executor(None, _primary_series_files, folder)
+        files = await loop.run_in_executor(None, _series_files_by_index, folder, series)
         if not files:
             raise ValueError("No slices available for this series")
+        if len(files) < 2:
+            raise ValueError(
+                "This series has only one image and can't be reconstructed into MPR planes"
+            )
         files = _subsample_depth(files, _VOLUME_MAX_DEPTH)
         volume = await loop.run_in_executor(None, _build_volume, folder, files)
         _VOLUME_CACHE[key] = (dir_mtime, volume)
-        await loop.run_in_executor(None, _save_volume_to_disk, folder, dir_mtime, volume)
+        await loop.run_in_executor(None, _save_volume_to_disk, folder, series, dir_mtime, volume)
         return volume
 
 
@@ -822,26 +925,53 @@ async def get_mpr_mip(
     )
 
 
+@router.get("/{study_id}/series")
+async def list_study_series(
+    study_id: UUID,
+    svc: StudyService = Depends(get_service),
+):
+    """Real series list for the sidebar, largest-first (index 0 = the
+    series MPR reconstructs by default). Replaces the old static per-
+    modality placeholder labels (SERIES_MAP on the frontend) — those were
+    generic copy unrelated to what was actually uploaded, which is why
+    clicking "Coronal"/"Sagittal"/"Scout" never showed anything different:
+    they were never real distinct series, just an arbitrary equal split of
+    one flat file list.
+    """
+    study = await svc.get(study_id)
+    if not study:
+        raise HTTPException(status_code=404, detail="Study not found")
+    if not study.dicom_path or not os.path.isdir(study.dicom_path):
+        return {"series": []}
+    loop = asyncio.get_event_loop()
+    groups = await loop.run_in_executor(None, _all_series_groups, study.dicom_path)
+    return {
+        "series": [
+            {
+                "index": i,
+                "count": len(g.files),
+                "modality": g.modality,
+                "description": g.description,
+            }
+            for i, g in enumerate(groups)
+        ]
+    }
+
+
 @router.get("/{study_id}/files")
 async def list_study_files(
     study_id: UUID,
+    series: int = Query(default=0, ge=0),
     svc: StudyService = Depends(get_service),
 ):
     """Returns filenames in true acquisition order (DICOM InstanceNumber /
     SliceLocation), not filename order, so the viewer can build full WADO
     URLs and reliably stack slices for MPR reconstruction.
 
-    Returns only the primary series' files (see _primary_series_files) —
-    the same set MPR reconstructs from. Previously this returned every file
-    in the folder, which the frontend then re-chunked into N arbitrary
-    equal pieces to fill the sidebar's generic series tabs. Those chunk
-    boundaries didn't line up with the real series boundaries MPR now
-    respects, so scrolling the axial pane to "slice 162" and looking at the
-    coronal/sagittal/MIP panes showed a *different* physical position than
-    the axial slice on screen — the axial view and the MPR volume were
-    silently built from different file sets. Serving one consistent file
-    list to both keeps "current slice" meaning the same physical location
-    everywhere.
+    Returns one real series' files (see _all_series_groups), selected by
+    its position in the largest-first list — the same grouping/ordering
+    MPR uses, so "series 0" always means the same physical files on both
+    the axial pane and the MPR volume for that index.
     """
     study = await svc.get(study_id)
     if not study:
@@ -849,7 +979,7 @@ async def list_study_files(
     if not study.dicom_path or not os.path.isdir(study.dicom_path):
         return {"files": []}
     loop = asyncio.get_event_loop()
-    files = await loop.run_in_executor(None, _primary_series_files, study.dicom_path)
+    files = await loop.run_in_executor(None, _series_files_by_index, study.dicom_path, series)
     return {"files": files}
 
 
@@ -915,9 +1045,10 @@ async def serve_dicom_preview(
     if not os.path.isfile(file_path):
         raise HTTPException(status_code=404, detail=f"File '{filename}' not found")
 
+    mtime = os.path.getmtime(file_path)
     loop = asyncio.get_event_loop()
     jpeg_bytes: bytes = await loop.run_in_executor(
-        None, _dicom_to_jpeg, file_path, wc, ww, quality, study.dicom_path
+        None, _cached_dicom_to_jpeg, file_path, mtime, wc, ww, quality, study.dicom_path
     )
 
     return StreamingResponse(
