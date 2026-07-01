@@ -146,6 +146,20 @@ def _folder_auto_window(folder: str) -> tuple[float, float]:
     return (wc, ww)
 
 
+def _native_window(ds) -> tuple[float, float] | None:
+    """The scanner's own WindowCenter/WindowWidth tag, if present — this is
+    normally the same clinically-chosen setting (e.g. abdomen soft tissue,
+    WC 40 / WW 80) across every slice in a real series."""
+    dicom_wc = getattr(ds, "WindowCenter", None)
+    dicom_ww = getattr(ds, "WindowWidth", None)
+    if dicom_wc is None or dicom_ww is None:
+        return None
+    # Some DICOMs store these as sequences
+    wc = float(dicom_wc[0] if hasattr(dicom_wc, "__len__") else dicom_wc)
+    ww = float(dicom_ww[0] if hasattr(dicom_ww, "__len__") else dicom_ww)
+    return wc, ww
+
+
 def _dicom_to_jpeg(
     file_path: str,
     wc: float | None,
@@ -167,12 +181,9 @@ def _dicom_to_jpeg(
 
     # Use DICOM window tags if caller didn't specify
     if wc is None or ww is None:
-        dicom_wc = getattr(ds, "WindowCenter", None)
-        dicom_ww = getattr(ds, "WindowWidth", None)
-        if dicom_wc is not None and dicom_ww is not None:
-            # Some DICOMs store these as sequences
-            wc = float(dicom_wc[0] if hasattr(dicom_wc, "__len__") else dicom_wc)
-            ww = float(dicom_ww[0] if hasattr(dicom_ww, "__len__") else dicom_ww)
+        native = _native_window(ds)
+        if native is not None:
+            wc, ww = native
         elif folder is not None:
             # Series-consistent auto-window (see _folder_auto_window) —
             # NOT a per-slice percentile, which is what caused the banding.
@@ -449,6 +460,11 @@ def _sorted_dicom_files(folder: str) -> list[str]:
 # cached in memory, after which every coronal/sagittal/MIP request is just a
 # numpy slice + single JPEG encode — a few milliseconds.
 
+# Bumped whenever the volume-build logic changes in a way that changes the
+# resulting pixel values (e.g. the windowing fix below) — included in the
+# cache key so a stale on-disk/in-memory volume built under the old logic
+# never gets served just because the DICOM folder itself hasn't changed.
+_VOLUME_CACHE_VERSION = 2
 _VOLUME_MAX_DIM = 320  # same cap the old client-side reconstruction used
 # Reading+decoding hundreds of DICOM files is I/O-bound (disk reads, and
 # native decompression that releases the GIL), so this can usefully exceed
@@ -513,7 +529,10 @@ def _volume_cache_dir(folder: str) -> str:
 
 
 def _volume_cache_path(folder: str, series: int, series_count: int, mtime: float) -> str:
-    return os.path.join(_volume_cache_dir(folder), f"vol_{series}_{series_count}_{int(mtime)}.npy")
+    return os.path.join(
+        _volume_cache_dir(folder),
+        f"vol_v{_VOLUME_CACHE_VERSION}_{series}_{series_count}_{int(mtime)}.npy",
+    )
 
 
 def _load_volume_from_disk(folder: str, series: int, series_count: int, mtime: float) -> np.ndarray | None:
@@ -534,8 +553,8 @@ def _load_volume_from_disk(folder: str, series: int, series_count: int, mtime: f
 def _save_volume_to_disk(folder: str, series: int, series_count: int, mtime: float, volume: np.ndarray) -> None:
     try:
         cache_dir = _volume_cache_dir(folder)
-        current_name = f"vol_{series}_{series_count}_{int(mtime)}.npy"
-        prefix = f"vol_{series}_{series_count}_"
+        current_name = f"vol_v{_VOLUME_CACHE_VERSION}_{series}_{series_count}_{int(mtime)}.npy"
+        prefix = f"vol_v{_VOLUME_CACHE_VERSION}_{series}_{series_count}_"
         for fname in os.listdir(cache_dir):
             if fname.startswith(prefix) and fname != current_name:
                 try:
@@ -547,13 +566,39 @@ def _save_volume_to_disk(folder: str, series: int, series_count: int, mtime: flo
         pass  # disk cache is a best-effort speedup, never worth failing the request over
 
 
+def _series_window(folder: str, files: list[str]) -> tuple[float, float]:
+    """The single (wc, ww) applied to every slice in this MPR volume.
+
+    This MUST use the same precedence as the 2D /preview endpoint
+    (_dicom_to_jpeg): the scanner's own WindowCenter/WindowWidth tag first,
+    falling back to the shared folder auto-window only if the tag is
+    missing. The volume build previously skipped straight to the
+    percentile-based auto-window and ignored the native tag entirely —
+    since that auto-window is derived from a handful of sampled slices
+    (often mostly air/background), it came out far narrower/lower than the
+    scanner's real soft-tissue window, which clipped most real anatomy to
+    white. Checked once per series (not per slice): a manufacturer-set
+    WC/WW tag is normally identical across an entire series anyway, so this
+    doesn't reintroduce the per-slice-derived-window banding bug.
+    """
+    for fname in files[: min(5, len(files))]:
+        try:
+            ds = dcmread(os.path.join(folder, fname), stop_before_pixels=True)
+        except Exception:
+            continue
+        native = _native_window(ds)
+        if native is not None:
+            return native
+    return _folder_auto_window(folder)
+
+
 def _build_volume(folder: str, files: list[str]) -> np.ndarray:
     """Reads every slice's raw pixel data directly (threaded — I/O + native
     decompression release the GIL, so this isn't fully serial even under
     Python), applies the same series-consistent window used for the 2D
     previews, downsamples in-plane, and stacks into one (depth, height,
     width) uint8 volume."""
-    wc, ww = _folder_auto_window(folder)
+    wc, ww = _series_window(folder, files)
     lo = wc - ww / 2.0
     hi = wc + ww / 2.0
     denom = max(hi - lo, 1e-6)
@@ -581,7 +626,7 @@ async def _get_volume(folder: str, series: int, series_count: int) -> np.ndarray
     and meta/coronal/sagittal/mip are all requested at once on a cold cache,
     only one of them actually builds the volume — the rest just wait on the
     same build instead of each redoing it."""
-    key = f"{folder}|{series}|{series_count}"
+    key = f"v{_VOLUME_CACHE_VERSION}|{folder}|{series}|{series_count}"
     try:
         dir_mtime = os.path.getmtime(folder)
     except OSError:
