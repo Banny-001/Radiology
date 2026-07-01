@@ -12,6 +12,7 @@ import {
   MessageCircle,
   X as XIcon,
   AlertTriangle,
+  Loader2,
 } from "lucide-react";
 import { useStudies } from "../../context/StudyContext";
 import { useAuth } from "../../context/AuthContext";
@@ -96,7 +97,7 @@ export default function ViewerPage() {
   // The volume itself is now built server-side (see studies.py /mpr/*) from
   // raw DICOM pixel data, cached in memory per series — this hook only
   // fetches the resulting dimensions, not hundreds of slice images.
-  const { meta: mprMeta, error: mprError } = useMprMeta(
+  const { meta: mprMeta, loading: mprLoading, error: mprError } = useMprMeta(
     study?.id ?? "",
     activeSeries,
     seriesCountForVolume,
@@ -908,6 +909,27 @@ export default function ViewerPage() {
     boxSizing: "border-box",
   };
 
+  // A small, quiet spinner for the (usually few-second, first-open-only)
+  // wait while the server builds the volume for this series. Deliberately
+  // not the old "Reconstructing… NN%" text block — just enough to tell the
+  // difference between "still loading" and "nothing here", without
+  // dominating the panel.
+  const renderMprSpinner = () => (
+    <div
+      style={{
+        position: "absolute",
+        inset: 0,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        pointerEvents: "none",
+      }}
+    >
+      <style>{`@keyframes mprSpin { from { transform: rotate(0deg) } to { transform: rotate(360deg) } }`}</style>
+      <Loader2 size={18} color="#4b5563" style={{ animation: "mprSpin 0.9s linear infinite" }} />
+    </div>
+  );
+
   // ── Reconstructed coronal/sagittal panel ────────────────────────────────
   // The cut itself is now built server-side (see /mpr/coronal, /mpr/sagittal
   // in studies.py) from the cached volume — this just points an <img> at the
@@ -1069,6 +1091,7 @@ export default function ViewerPage() {
             offsetY={offset.y}
           />
         )}
+        {mprLoading && !planeSrc && renderMprSpinner()}
         {mprError && (
           <div
             style={{
@@ -1136,6 +1159,7 @@ export default function ViewerPage() {
             offsetY={0}
           />
         )}
+        {mprLoading && !mipSrc && renderMprSpinner()}
         {mprError && (
           <div
             style={{

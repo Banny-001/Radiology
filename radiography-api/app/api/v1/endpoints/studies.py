@@ -450,7 +450,10 @@ def _sorted_dicom_files(folder: str) -> list[str]:
 # numpy slice + single JPEG encode — a few milliseconds.
 
 _VOLUME_MAX_DIM = 320  # same cap the old client-side reconstruction used
-_VOLUME_BUILD_WORKERS = 4
+# Reading+decoding hundreds of DICOM files is I/O-bound (disk reads, and
+# native decompression that releases the GIL), so this can usefully exceed
+# the droplet's 2 vCPUs — it's overlapping waits, not fighting for cores.
+_VOLUME_BUILD_WORKERS = 8
 _VOLUME_CACHE: dict[str, tuple[float, np.ndarray]] = {}  # key -> (mtime, (depth,height,width) uint8)
 _VOLUME_LOCKS: dict[str, asyncio.Lock] = {}
 # NOT constructed here at import time on purpose: asyncio.Lock() binds to
@@ -501,6 +504,47 @@ def _resize_gray(arr: np.ndarray, width: int, height: int) -> np.ndarray:
         return arr
     img = Image.fromarray(arr, mode="L")
     return np.array(img.resize((width, height), Image.BILINEAR))
+
+
+def _volume_cache_dir(folder: str) -> str:
+    d = os.path.join(folder, ".mpr_cache")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _volume_cache_path(folder: str, series: int, series_count: int, mtime: float) -> str:
+    return os.path.join(_volume_cache_dir(folder), f"vol_{series}_{series_count}_{int(mtime)}.npy")
+
+
+def _load_volume_from_disk(folder: str, series: int, series_count: int, mtime: float) -> np.ndarray | None:
+    """Runs with 2 uvicorn workers, and the in-memory _VOLUME_CACHE is
+    per-process — if a request lands on the worker that didn't build the
+    volume, it would otherwise redo the full multi-second DICOM read+decode
+    pass from scratch. A small on-disk .npy cache lets it just load the
+    array instead (milliseconds), and also survives a backend restart."""
+    path = _volume_cache_path(folder, series, series_count, mtime)
+    if os.path.isfile(path):
+        try:
+            return np.load(path)
+        except Exception:
+            return None
+    return None
+
+
+def _save_volume_to_disk(folder: str, series: int, series_count: int, mtime: float, volume: np.ndarray) -> None:
+    try:
+        cache_dir = _volume_cache_dir(folder)
+        current_name = f"vol_{series}_{series_count}_{int(mtime)}.npy"
+        prefix = f"vol_{series}_{series_count}_"
+        for fname in os.listdir(cache_dir):
+            if fname.startswith(prefix) and fname != current_name:
+                try:
+                    os.remove(os.path.join(cache_dir, fname))
+                except OSError:
+                    pass
+        np.save(os.path.join(cache_dir, current_name), volume)
+    except Exception:
+        pass  # disk cache is a best-effort speedup, never worth failing the request over
 
 
 def _build_volume(folder: str, files: list[str]) -> np.ndarray:
@@ -557,12 +601,21 @@ async def _get_volume(folder: str, series: int, series_count: int) -> np.ndarray
         cached = _VOLUME_CACHE.get(key)
         if cached and cached[0] == dir_mtime:
             return cached[1]
+
+        loop = asyncio.get_event_loop()
+        disk_volume = await loop.run_in_executor(
+            None, _load_volume_from_disk, folder, series, series_count, dir_mtime
+        )
+        if disk_volume is not None:
+            _VOLUME_CACHE[key] = (dir_mtime, disk_volume)
+            return disk_volume
+
         files = _partition_files(_sorted_dicom_files(folder), series, series_count)
         if not files:
             raise ValueError("No slices available for this series")
-        loop = asyncio.get_event_loop()
         volume = await loop.run_in_executor(None, _build_volume, folder, files)
         _VOLUME_CACHE[key] = (dir_mtime, volume)
+        await loop.run_in_executor(None, _save_volume_to_disk, folder, series, series_count, dir_mtime, volume)
         return volume
 
 
