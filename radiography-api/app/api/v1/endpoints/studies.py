@@ -1,4 +1,5 @@
 import asyncio
+import collections
 import io
 import os
 import re
@@ -464,7 +465,7 @@ def _sorted_dicom_files(folder: str) -> list[str]:
 # resulting pixel values (e.g. the windowing fix below) — included in the
 # cache key so a stale on-disk/in-memory volume built under the old logic
 # never gets served just because the DICOM folder itself hasn't changed.
-_VOLUME_CACHE_VERSION = 2
+_VOLUME_CACHE_VERSION = 3
 _VOLUME_MAX_DIM = 320  # same cap the old client-side reconstruction used
 # Reading+decoding hundreds of DICOM files is I/O-bound (disk reads, and
 # native decompression that releases the GIL), so this can usefully exceed
@@ -489,15 +490,45 @@ def _volume_locks_guard() -> asyncio.Lock:
     return _VOLUME_LOCKS_GUARD
 
 
-def _partition_files(files: list[str], series: int, series_count: int) -> list[str]:
-    """Mirrors the frontend's partitionBySeries() so a given (series,
-    series_count) pair always refers to the same slice range on both sides."""
-    if not files or series_count <= 1:
+def _primary_series_files(folder: str) -> list[str]:
+    """The single, coherent set of files MPR should be built from.
+
+    MPR needs ONE real volumetric acquisition. The upload folder can (and
+    here, does) contain several distinct real DICOM series mixed together —
+    a genuine axial CT run, a scout/localizer, sometimes other reformats —
+    and naively splitting the whole flat file list into N equal chunks
+    (which is what the sidebar's generic "Axial Brain / Coronal / Sagittal
+    / Scout" labels implied should happen) interleaves slices from
+    different series/orientations whenever a chunk boundary doesn't line
+    up with a real series boundary. Stacked for MPR, that produces
+    non-anatomical banding — exactly what real per-series InstanceNumber
+    sequences restarting at 1 for each series would cause under a single
+    folder-wide sort. Grouping by the actual SeriesInstanceUID and taking
+    the largest group (reliably the true volumetric run, not the 1-frame
+    scout or a handful of secondary captures) is what a real DICOM viewer
+    does, and is what fixes this at the root instead of patching symptoms.
+    """
+    files = _sorted_dicom_files(folder)
+    if not files:
         return files
-    chunk = max(1, len(files) // series_count)
-    start = series * chunk
-    end = len(files) if series == series_count - 1 else start + chunk
-    return files[start:end]
+
+    groups: dict[str, list[str]] = collections.defaultdict(list)
+    for f in files:
+        try:
+            ds = dcmread(os.path.join(folder, f), stop_before_pixels=True, force=True)
+            uid = str(getattr(ds, "SeriesInstanceUID", "") or "unknown")
+        except Exception:
+            uid = "unknown"
+        groups[uid].append(f)
+
+    if len(groups) <= 1:
+        return files
+
+    primary_uid = max(groups, key=lambda uid: len(groups[uid]))
+    order = {f: i for i, f in enumerate(files)}
+    primary_files = groups[primary_uid]
+    primary_files.sort(key=lambda f: order[f])
+    return primary_files
 
 
 def _read_and_window_slice(path: str, lo: float, hi: float, denom: float) -> np.ndarray | None:
@@ -528,20 +559,20 @@ def _volume_cache_dir(folder: str) -> str:
     return d
 
 
-def _volume_cache_path(folder: str, series: int, series_count: int, mtime: float) -> str:
-    return os.path.join(
-        _volume_cache_dir(folder),
-        f"vol_v{_VOLUME_CACHE_VERSION}_{series}_{series_count}_{int(mtime)}.npy",
-    )
+def _volume_cache_path(folder: str, mtime: float) -> str:
+    # One volume per study (the primary series), not per sidebar tab —
+    # series/series_count no longer change which files get reconstructed,
+    # so keying by them would just rebuild the same volume redundantly.
+    return os.path.join(_volume_cache_dir(folder), f"vol_v{_VOLUME_CACHE_VERSION}_{int(mtime)}.npy")
 
 
-def _load_volume_from_disk(folder: str, series: int, series_count: int, mtime: float) -> np.ndarray | None:
+def _load_volume_from_disk(folder: str, mtime: float) -> np.ndarray | None:
     """Runs with 2 uvicorn workers, and the in-memory _VOLUME_CACHE is
     per-process — if a request lands on the worker that didn't build the
     volume, it would otherwise redo the full multi-second DICOM read+decode
     pass from scratch. A small on-disk .npy cache lets it just load the
     array instead (milliseconds), and also survives a backend restart."""
-    path = _volume_cache_path(folder, series, series_count, mtime)
+    path = _volume_cache_path(folder, mtime)
     if os.path.isfile(path):
         try:
             return np.load(path)
@@ -550,11 +581,11 @@ def _load_volume_from_disk(folder: str, series: int, series_count: int, mtime: f
     return None
 
 
-def _save_volume_to_disk(folder: str, series: int, series_count: int, mtime: float, volume: np.ndarray) -> None:
+def _save_volume_to_disk(folder: str, mtime: float, volume: np.ndarray) -> None:
     try:
         cache_dir = _volume_cache_dir(folder)
-        current_name = f"vol_v{_VOLUME_CACHE_VERSION}_{series}_{series_count}_{int(mtime)}.npy"
-        prefix = f"vol_v{_VOLUME_CACHE_VERSION}_{series}_{series_count}_"
+        current_name = f"vol_v{_VOLUME_CACHE_VERSION}_{int(mtime)}.npy"
+        prefix = f"vol_v{_VOLUME_CACHE_VERSION}_"
         for fname in os.listdir(cache_dir):
             if fname.startswith(prefix) and fname != current_name:
                 try:
@@ -621,12 +652,17 @@ def _build_volume(folder: str, files: list[str]) -> np.ndarray:
 
 
 async def _get_volume(folder: str, series: int, series_count: int) -> np.ndarray:
-    """Cached per (folder, series, series_count), invalidated on folder
-    mtime change. A per-key asyncio.Lock ensures that when MPR mode turns on
-    and meta/coronal/sagittal/mip are all requested at once on a cold cache,
-    only one of them actually builds the volume — the rest just wait on the
-    same build instead of each redoing it."""
-    key = f"v{_VOLUME_CACHE_VERSION}|{folder}|{series}|{series_count}"
+    """Cached per folder (invalidated on folder mtime change), one volume
+    per study regardless of which sidebar tab is active — see
+    _primary_series_files for why `series`/`series_count` no longer affect
+    which files get reconstructed. Kept as parameters only so the endpoint
+    call sites below don't need to change. A per-key asyncio.Lock ensures
+    that when MPR mode turns on and meta/coronal/sagittal/mip are all
+    requested at once on a cold cache, only one of them actually builds the
+    volume — the rest just wait on the same build instead of each redoing
+    it."""
+    del series, series_count  # no longer used for file selection — see above
+    key = f"v{_VOLUME_CACHE_VERSION}|{folder}"
     try:
         dir_mtime = os.path.getmtime(folder)
     except OSError:
@@ -648,19 +684,17 @@ async def _get_volume(folder: str, series: int, series_count: int) -> np.ndarray
             return cached[1]
 
         loop = asyncio.get_event_loop()
-        disk_volume = await loop.run_in_executor(
-            None, _load_volume_from_disk, folder, series, series_count, dir_mtime
-        )
+        disk_volume = await loop.run_in_executor(None, _load_volume_from_disk, folder, dir_mtime)
         if disk_volume is not None:
             _VOLUME_CACHE[key] = (dir_mtime, disk_volume)
             return disk_volume
 
-        files = _partition_files(_sorted_dicom_files(folder), series, series_count)
+        files = await loop.run_in_executor(None, _primary_series_files, folder)
         if not files:
             raise ValueError("No slices available for this series")
         volume = await loop.run_in_executor(None, _build_volume, folder, files)
         _VOLUME_CACHE[key] = (dir_mtime, volume)
-        await loop.run_in_executor(None, _save_volume_to_disk, folder, series, series_count, dir_mtime, volume)
+        await loop.run_in_executor(None, _save_volume_to_disk, folder, dir_mtime, volume)
         return volume
 
 

@@ -161,6 +161,14 @@ export default function ViewerPage() {
   const pinchStartZoomRef = useRef(1);
   const touchDragStartRef = useRef({ x: 0, y: 0 });
   const touchIsDraggingRef = useRef(false);
+  // Dragging the crosshair fires a mousemove every couple of pixels, and
+  // each one was requesting a brand-new coronal/sagittal/axial image from
+  // the server — dozens of in-flight requests per second while dragging.
+  // Gating updates to one per ~80ms keeps the drag feeling live without
+  // flooding the network; mousedown still updates immediately so clicking
+  // feels instant.
+  const crosshairThrottleRef = useRef(0);
+  const CROSSHAIR_THROTTLE_MS = 80;
   // Trackpads fire dozens of tiny wheel events per swipe; stepping one slice
   // per raw event makes scrolling feel erratic. Accumulating delta and only
   // stepping once it crosses a threshold turns that into smooth, evenly
@@ -760,7 +768,13 @@ export default function ViewerPage() {
 
     const handleMouseMove = (e: React.MouseEvent) => {
       if (isCrosshair) {
-        if (isDragging) updateCrosshairFromEvent(e);
+        if (isDragging) {
+          const now = Date.now();
+          if (now - crosshairThrottleRef.current >= CROSSHAIR_THROTTLE_MS) {
+            crosshairThrottleRef.current = now;
+            updateCrosshairFromEvent(e);
+          }
+        }
         return;
       }
       if (isMeasurementTool(activeTool) && pendingPoints.length > 0) {
@@ -1020,7 +1034,13 @@ export default function ViewerPage() {
 
     const handleMouseMove = (e: React.MouseEvent) => {
       if (isCrosshair) {
-        if (isDragging) updateCrosshairFromEvent(e);
+        if (isDragging) {
+          const now = Date.now();
+          if (now - crosshairThrottleRef.current >= CROSSHAIR_THROTTLE_MS) {
+            crosshairThrottleRef.current = now;
+            updateCrosshairFromEvent(e);
+          }
+        }
         return;
       }
       if (isMeasurementTool(activeTool) && pendingPoints.length > 0) {
@@ -1143,6 +1163,11 @@ export default function ViewerPage() {
     const mipSrc = mprMeta
       ? `/api/v1/studies/${study.id}/mpr/mip?series=${activeSeries}&series_count=${series.length}`
       : null;
+    // MIP's vertical axis IS the axial (Z) axis, so a line at the current
+    // slice's fraction down that axis shows exactly what level of the body
+    // the axial/coronal/sagittal panes are currently looking at — same
+    // idea as the crosshair lines, just for "where am I along the body."
+    const axFrac = maxSlices > 1 ? (currentSlice - 1) / (maxSlices - 1) : 0.5;
 
     return (
       <div style={{ width: "100%", height: "100%", position: "relative" }}>
@@ -1158,6 +1183,29 @@ export default function ViewerPage() {
             offsetX={0}
             offsetY={0}
           />
+        )}
+        {mipSrc && (
+          <svg
+            style={{
+              position: "absolute",
+              inset: 0,
+              width: "100%",
+              height: "100%",
+              pointerEvents: "none",
+              zIndex: 6,
+            }}
+          >
+            <line
+              x1="0"
+              y1={`${axFrac * 100}%`}
+              x2="100%"
+              y2={`${axFrac * 100}%`}
+              stroke="#facc15"
+              strokeWidth={1}
+              strokeDasharray="5 4"
+              opacity={0.85}
+            />
+          </svg>
         )}
         {mprLoading && !mipSrc && renderMprSpinner()}
         {mprError && (
@@ -1193,7 +1241,7 @@ export default function ViewerPage() {
             zIndex: 5,
           }}
         >
-          3D · MIP projection
+          3D · MIP projection · Level {currentSlice}/{maxSlices}
         </div>
       </div>
     );
