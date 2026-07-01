@@ -20,6 +20,11 @@ import { renderImage } from "./components/medicalImages";
 import { StudyInfoPanel } from "./components/StudyInfoPanel";
 import { DiscussionPanel } from "./components/DiscussionPanel";
 import DicomViewer from "./DicomViewer";
+import { useDicomVolume } from "./components/useDicomVolume";
+import { reconstructCoronal, reconstructSagittal } from "./components/reconstructPlane";
+import ReconstructedPlaneCanvas from "./components/ReconstructedPlaneCanvas";
+import { useLocalizerStrip } from "./components/useLocalizerStrip";
+import SliceScrubber from "./components/SliceScrubber";
 
 // ─── Measurement types ──────────────────────────────────────────────────
 type MeasurementType = "length" | "angle" | "area" | "arrow";
@@ -80,6 +85,37 @@ export default function ViewerPage() {
   // Real DICOM file count reported back by DicomViewer.
   const [dicomFileCount, setDicomFileCount] = useState(0);
 
+  // ── Real MPR: reconstructed coronal/sagittal slice position ─────────────
+  // (1-based, like currentSlice, so the on-screen "n / max" labels line up)
+  const [coronalSlice, setCoronalSlice] = useState<number | null>(null);
+  const [sagittalSlice, setSagittalSlice] = useState<number | null>(null);
+
+  const seriesCountForVolume = study
+    ? (SERIES_MAP[study.modality] ?? SERIES_MAP.CT).length
+    : 1;
+  const {
+    volume,
+    progress: volumeProgress,
+    error: volumeError,
+  } = useDicomVolume(
+    study?.id ?? "",
+    activeSeries,
+    seriesCountForVolume,
+    isMprMode && !!study?.dicom_path,
+  );
+  const coronalMax = volume?.height ?? 1;
+  const sagittalMax = volume?.width ?? 1;
+
+  // Cheap, always-on position indicator for the slice scrubber — sampled
+  // from a bounded number of slices, so unlike the full MPR volume this
+  // doesn't need to be gated behind MPR mode.
+  const { strip: localizerStrip } = useLocalizerStrip(
+    study?.id ?? "",
+    activeSeries,
+    seriesCountForVolume,
+    !!study?.dicom_path,
+  );
+
   // ── Measurement state ──────────────────────────────────────────────────
   const [measurements, setMeasurements] = useState<Measurement[]>([]);
   const [pendingPoints, setPendingPoints] = useState<Point[]>([]);
@@ -92,6 +128,36 @@ export default function ViewerPage() {
   offsetRef.current = offset;
   const zoomRef = useRef(zoom);
   zoomRef.current = zoom;
+  const isMprModeRef = useRef(isMprMode);
+  isMprModeRef.current = isMprMode;
+  const activeMprPanelRef = useRef(activeMprPanel);
+  activeMprPanelRef.current = activeMprPanel;
+  const coronalMaxRef = useRef(coronalMax);
+  coronalMaxRef.current = coronalMax;
+  const sagittalMaxRef = useRef(sagittalMax);
+  sagittalMaxRef.current = sagittalMax;
+
+  // Advances whichever plane is currently "active": the axial slice normally,
+  // or — in MPR mode — the coronal/sagittal cut position when one of those
+  // panels is the one selected. This is what makes each MPR pane genuinely
+  // independently scrollable through its own real reconstructed depth.
+  const advanceActiveSlice = (step: number) => {
+    if (isMprModeRef.current && activeMprPanelRef.current === 1) {
+      setCoronalSlice((s) => {
+        const cur = s ?? Math.ceil(coronalMaxRef.current / 2);
+        return Math.max(1, Math.min(coronalMaxRef.current, cur + step));
+      });
+      return;
+    }
+    if (isMprModeRef.current && activeMprPanelRef.current === 2) {
+      setSagittalSlice((s) => {
+        const cur = s ?? Math.ceil(sagittalMaxRef.current / 2);
+        return Math.max(1, Math.min(sagittalMaxRef.current, cur + step));
+      });
+      return;
+    }
+    setCurrentSlice((s) => Math.max(1, Math.min(maxSlicesRef.current, s + step)));
+  };
 
   const placeholderMaxSlices = study
     ? ((SERIES_MAP[study.modality] ?? SERIES_MAP.CT)[activeSeries]?.count ?? 1)
@@ -103,6 +169,12 @@ export default function ViewerPage() {
 
   const pinchStartDistRef = useRef<number | null>(null);
   const pinchStartZoomRef = useRef(1);
+  // Trackpads fire dozens of tiny wheel events per swipe; stepping one slice
+  // per raw event makes scrolling feel erratic. Accumulating delta and only
+  // stepping once it crosses a threshold turns that into smooth, evenly
+  // paced slice-per-distance scrolling regardless of input device.
+  const wheelAccumRef = useRef(0);
+  const WHEEL_SLICE_THRESHOLD = 55;
   const touchDragStartRef = useRef({ x: 0, y: 0 });
   const touchIsDraggingRef = useRef(false);
   const viewportCleanupRef = useRef<() => void>(() => {});
@@ -122,13 +194,14 @@ export default function ViewerPage() {
       if (activeToolRef.current === "zoom") {
         e.preventDefault();
         setZoom((z) => Math.min(3, Math.max(0.3, z - e.deltaY * 0.001)));
-      } else {
-        e.preventDefault();
-        setCurrentSlice((s) =>
-          e.deltaY > 0
-            ? Math.min(maxSlicesRef.current, s + 1)
-            : Math.max(1, s - 1),
-        );
+        return;
+      }
+      e.preventDefault();
+      wheelAccumRef.current += e.deltaY;
+      while (Math.abs(wheelAccumRef.current) >= WHEEL_SLICE_THRESHOLD) {
+        const dir = wheelAccumRef.current > 0 ? 1 : -1;
+        advanceActiveSlice(dir);
+        wheelAccumRef.current -= dir * WHEEL_SLICE_THRESHOLD;
       }
     };
 
@@ -166,11 +239,7 @@ export default function ViewerPage() {
           e.preventDefault();
           const dy = t.clientY - touchDragStartRef.current.y;
           if (Math.abs(dy) > 12) {
-            setCurrentSlice((s) =>
-              dy < 0
-                ? Math.min(maxSlicesRef.current, s + 1)
-                : Math.max(1, s - 1),
-            );
+            advanceActiveSlice(dy < 0 ? 1 : -1);
             touchDragStartRef.current = { x: t.clientX, y: t.clientY };
           }
         }
@@ -229,9 +298,9 @@ export default function ViewerPage() {
         return;
       }
       if (e.key === "ArrowUp" || e.key === "ArrowRight") {
-        setCurrentSlice((s) => Math.min(maxSlicesRef.current, s + 1));
+        advanceActiveSlice(1);
       } else if (e.key === "ArrowDown" || e.key === "ArrowLeft") {
-        setCurrentSlice((s) => Math.max(1, s - 1));
+        advanceActiveSlice(-1);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -266,7 +335,7 @@ export default function ViewerPage() {
     if (toolId === "cine") setIsCinePlaying((p) => !p);
     if (toolId === "mpr") {
       setIsMprMode((m) => !m);
-      setActiveMprPanel(3); // reset to bottom-right when toggling MPR
+      setActiveMprPanel(0); // reset to Axial when toggling MPR
     }
     if (toolId === "full") {
       if (!document.fullscreenElement) {
@@ -285,7 +354,9 @@ export default function ViewerPage() {
       setIsInverted(false);
       setIsCinePlaying(false);
       setIsMprMode(false);
-      setActiveMprPanel(3);
+      setActiveMprPanel(0);
+      setCoronalSlice(null);
+      setSagittalSlice(null);
       setMeasurements([]);
       setPendingPoints([]);
       setHoverPoint(null);
@@ -610,9 +681,7 @@ export default function ViewerPage() {
       } else if (activeTool === "scroll") {
         const dy = e.clientY - dragStart.y;
         if (Math.abs(dy) > 8) {
-          setCurrentSlice((s) =>
-            dy > 0 ? Math.min(maxSlices, s + 1) : Math.max(1, s - 1),
-          );
+          advanceActiveSlice(dy > 0 ? 1 : -1);
           setDragStart({ x: e.clientX, y: e.clientY });
         }
       } else if (activeTool === "zoom") {
@@ -734,23 +803,305 @@ export default function ViewerPage() {
     );
   };
 
-  // ── Viewport: single panel OR 2×2 MPR quad ──────────────────────────────
+  // ── MPR panel chrome (border highlight for whichever pane is active) ────
+  const mprPanelWrapperStyle = (isActive: boolean): React.CSSProperties => ({
+    background: "#000",
+    border: `2px solid ${isActive ? "#1A73E8" : "#333"}`,
+    overflow: "hidden",
+    position: "relative",
+    cursor: isActive ? "default" : "pointer",
+    boxSizing: "border-box",
+  });
+
+  // ── Reconstructed coronal/sagittal panel ────────────────────────────────
+  // Unlike the old MPR mode (which just showed three axial slices at
+  // different depths under misleading labels), this actually resamples the
+  // volume built by useDicomVolume along the coronal/sagittal axis, so each
+  // pane shows a genuinely different orthogonal cut of the same anatomy.
+  const renderPlanePanel = (
+    plane: "coronal" | "sagittal",
+    isActive: boolean,
+    label: string,
+  ) => {
+    const isReadOnly = !isActive;
+    const sliceMax = plane === "coronal" ? coronalMax : sagittalMax;
+    const sliceValue =
+      (plane === "coronal" ? coronalSlice : sagittalSlice) ??
+      Math.ceil(sliceMax / 2);
+
+    const planeImage = volume
+      ? plane === "coronal"
+        ? reconstructCoronal(volume, sliceValue - 1)
+        : reconstructSagittal(volume, sliceValue - 1)
+      : null;
+
+    const localPoint = (e: React.MouseEvent): Point => {
+      const rect = e.currentTarget.getBoundingClientRect();
+      return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    };
+
+    const finishMeasurement = (type: MeasurementType, pts: Point[]) => {
+      setMeasurements((prev) => [
+        ...prev,
+        {
+          id: `m_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          type,
+          points: pts,
+        },
+      ]);
+      setPendingPoints([]);
+      setHoverPoint(null);
+    };
+
+    const handleViewportClick = (e: React.MouseEvent) => {
+      if (isReadOnly) return;
+      if (!isMeasurementTool(activeTool)) return;
+      const p = localPoint(e);
+      const next = [...pendingPoints, p];
+      if (activeTool === "length" || activeTool === "arrow") {
+        if (next.length >= 2) finishMeasurement(activeTool, next);
+        else setPendingPoints(next);
+      } else if (activeTool === "angle") {
+        if (next.length >= 3) finishMeasurement("angle", next);
+        else setPendingPoints(next);
+      } else if (activeTool === "area") {
+        setPendingPoints(next);
+      }
+    };
+
+    const handleDoubleClick = (e: React.MouseEvent) => {
+      if (isReadOnly) return;
+      if (activeTool === "area" && pendingPoints.length >= 3) {
+        e.preventDefault();
+        finishMeasurement("area", pendingPoints);
+      }
+    };
+
+    const handleMouseDown = (e: React.MouseEvent) => {
+      if (isReadOnly) return;
+      if (isMeasurementTool(activeTool)) return;
+      if (activeTool === "pan") {
+        setIsDragging(true);
+        setDragStart({ x: e.clientX - offset.x, y: e.clientY - offset.y });
+      } else if (
+        activeTool === "wl" ||
+        activeTool === "scroll" ||
+        activeTool === "zoom"
+      ) {
+        setIsDragging(true);
+        setDragStart({ x: e.clientX, y: e.clientY });
+      }
+    };
+
+    const handleMouseMove = (e: React.MouseEvent) => {
+      if (isReadOnly) return;
+      if (isMeasurementTool(activeTool) && pendingPoints.length > 0) {
+        setHoverPoint(localPoint(e));
+      }
+      if (!isDragging) return;
+      if (activeTool === "pan") {
+        setOffset({ x: e.clientX - dragStart.x, y: e.clientY - dragStart.y });
+      } else if (activeTool === "wl") {
+        const dy = e.clientY - dragStart.y;
+        if (Math.abs(dy) > 1) {
+          setBrightness((b) => Math.max(0.1, Math.min(2.5, b - dy * 0.005)));
+          setDragStart({ x: e.clientX, y: e.clientY });
+        }
+      } else if (activeTool === "scroll") {
+        const dy = e.clientY - dragStart.y;
+        if (Math.abs(dy) > 8) {
+          advanceActiveSlice(dy > 0 ? 1 : -1);
+          setDragStart({ x: e.clientX, y: e.clientY });
+        }
+      } else if (activeTool === "zoom") {
+        const dy = e.clientY - dragStart.y;
+        if (Math.abs(dy) > 1) {
+          setZoom((z) => Math.max(0.3, Math.min(3, z - dy * 0.003)));
+          setDragStart({ x: e.clientX, y: e.clientY });
+        }
+      }
+    };
+
+    const handleMouseUp = () => setIsDragging(false);
+
+    const cursor = isReadOnly
+      ? "pointer"
+      : isMeasurementTool(activeTool)
+        ? "crosshair"
+        : activeTool === "pan"
+          ? isDragging
+            ? "grabbing"
+            : "grab"
+          : activeTool === "zoom"
+            ? "zoom-in"
+            : activeTool === "wl" || activeTool === "scroll"
+              ? "ns-resize"
+              : "default";
+
+    return (
+      <div
+        ref={isActive ? setViewportRef : undefined}
+        style={{
+          width: "100%",
+          height: "100%",
+          overflow: "hidden",
+          touchAction: "none",
+          cursor,
+          position: "relative",
+        }}
+        onClick={handleViewportClick}
+        onDoubleClick={handleDoubleClick}
+        onMouseDown={handleMouseDown}
+        onMouseMove={handleMouseMove}
+        onMouseUp={handleMouseUp}
+        onMouseLeave={handleMouseUp}
+      >
+        <ReconstructedPlaneCanvas
+          plane={planeImage}
+          brightness={brightness}
+          isInverted={isInverted}
+          zoom={zoom}
+          rotation={rotation}
+          flipH={flipH}
+          flipV={flipV}
+          offsetX={offset.x}
+          offsetY={offset.y}
+        />
+        {!volume && (
+          <div
+            style={{
+              position: "absolute",
+              inset: 0,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              flexDirection: "column",
+              gap: 6,
+              color: volumeError ? "#ef4444" : "#6b7280",
+              fontSize: 10,
+              fontFamily: "monospace",
+              textAlign: "center",
+              padding: 12,
+            }}
+          >
+            {volumeError ? (
+              <span>{volumeError}</span>
+            ) : (
+              <>
+                <span>Reconstructing {label.toLowerCase()}…</span>
+                <span>{volumeProgress}%</span>
+              </>
+            )}
+          </div>
+        )}
+        <div
+          style={{
+            position: "absolute",
+            top: 6,
+            left: 6,
+            fontSize: "10px",
+            fontFamily: "monospace",
+            color: "#93c5fd",
+            background: "rgba(0,0,0,0.55)",
+            padding: "2px 6px",
+            borderRadius: "4px",
+            pointerEvents: "none",
+            zIndex: 5,
+          }}
+        >
+          {label} · {sliceValue}/{sliceMax}
+        </div>
+        {!isActive && (
+          <div
+            style={{
+              position: "absolute",
+              bottom: 4,
+              right: 6,
+              fontSize: "9px",
+              fontFamily: "monospace",
+              color: "rgba(255,255,255,0.35)",
+              pointerEvents: "none",
+            }}
+          >
+            tap to activate
+          </div>
+        )}
+        {isActive && renderMeasurementOverlay()}
+      </div>
+    );
+  };
+
+  // ── Localizer panel (bottom-right) ──────────────────────────────────────
+  // A read-only reference view of the axial slice with crosshair lines
+  // showing where the coronal and sagittal panes are currently cutting
+  // through the volume — standard PACS MPR chrome, and a much more honest
+  // use of the 4th quadrant than duplicating the axial pane under a
+  // different label.
+  const renderLocalizerPanel = () => {
+    const yFrac = coronalMax > 1 ? (coronalSlice ?? coronalMax / 2) / coronalMax : 0.5;
+    const xFrac = sagittalMax > 1 ? (sagittalSlice ?? sagittalMax / 2) / sagittalMax : 0.5;
+
+    return (
+      <div style={{ width: "100%", height: "100%", position: "relative" }}>
+        {renderSinglePanel("100%", "100%", currentSlice)}
+        {volume && (
+          <svg
+            style={{
+              position: "absolute",
+              inset: 0,
+              width: "100%",
+              height: "100%",
+              pointerEvents: "none",
+            }}
+          >
+            <line
+              x1="0"
+              y1={`${yFrac * 100}%`}
+              x2="100%"
+              y2={`${yFrac * 100}%`}
+              stroke="#facc15"
+              strokeWidth={1}
+              strokeDasharray="4 3"
+            />
+            <line
+              x1={`${xFrac * 100}%`}
+              y1="0"
+              x2={`${xFrac * 100}%`}
+              y2="100%"
+              stroke="#facc15"
+              strokeWidth={1}
+              strokeDasharray="4 3"
+            />
+          </svg>
+        )}
+        <div
+          style={{
+            position: "absolute",
+            top: 6,
+            left: 6,
+            fontSize: "10px",
+            fontFamily: "monospace",
+            color: "#93c5fd",
+            background: "rgba(0,0,0,0.55)",
+            padding: "2px 6px",
+            borderRadius: "4px",
+            pointerEvents: "none",
+            zIndex: 5,
+          }}
+        >
+          Localizer · {currentSlice}/{maxSlices}
+        </div>
+      </div>
+    );
+  };
+
+  // ── Viewport: single panel OR 2×2 real MPR quad ─────────────────────────
   const renderViewport = (w: string, h: string) => {
     if (!isMprMode) return renderSinglePanel(w, h);
 
-    const total = maxSlices;
-    const q1 = Math.max(1, Math.round(total * 0.25));
-    const q2 = Math.max(1, Math.round(total * 0.5));
-    const q3 = Math.max(1, Math.round(total * 0.75));
-
-    // Each panel has a label and a fixed reference slice shown when inactive.
-    // When a panel is active it shows currentSlice and accepts user input.
-    const panels = [
-      { label: "Axial",    fixedSlice: q1 },
-      { label: "Coronal",  fixedSlice: q2 },
-      { label: "Sagittal", fixedSlice: q3 },
-      { label: "Active",   fixedSlice: currentSlice },
-    ];
+    const axialActive = activeMprPanel === 0;
+    const coronalActive = activeMprPanel === 1;
+    const sagittalActive = activeMprPanel === 2;
 
     return (
       <div
@@ -764,47 +1115,36 @@ export default function ViewerPage() {
           background: "#1a1a1a",
         }}
       >
-        {panels.map((panel, i) => {
-          const isActive = activeMprPanel === i;
-          // Active panel is interactive (no sliceOverride), others are read-only
-          const sliceArg = isActive ? undefined : panel.fixedSlice;
-          const displaySlice = isActive ? currentSlice : panel.fixedSlice;
-          const panelLabel = `${panel.label} · ${displaySlice}/${total}`;
-
-          return (
+        <div onClick={() => setActiveMprPanel(0)} style={mprPanelWrapperStyle(axialActive)}>
+          {renderSinglePanel(
+            "100%",
+            "100%",
+            axialActive ? undefined : currentSlice,
+            `Axial · ${currentSlice}/${maxSlices}`,
+          )}
+          {!axialActive && (
             <div
-              key={i}
-              onClick={() => setActiveMprPanel(i)}
               style={{
-                background: "#000",
-                border: `2px solid ${isActive ? "#1A73E8" : "#333"}`,
-                overflow: "hidden",
-                position: "relative",
-                // Pointer on the wrapper so tapping it feels clickable on mobile
-                cursor: isActive ? "default" : "pointer",
-                boxSizing: "border-box",
+                position: "absolute",
+                bottom: 4,
+                right: 6,
+                fontSize: "9px",
+                fontFamily: "monospace",
+                color: "rgba(255,255,255,0.35)",
+                pointerEvents: "none",
               }}
             >
-              {renderSinglePanel("100%", "100%", sliceArg, panelLabel)}
-              {/* "Tap to activate" hint on inactive panels (mobile-friendly) */}
-              {!isActive && (
-                <div
-                  style={{
-                    position: "absolute",
-                    bottom: 4,
-                    right: 6,
-                    fontSize: "9px",
-                    fontFamily: "monospace",
-                    color: "rgba(255,255,255,0.35)",
-                    pointerEvents: "none",
-                  }}
-                >
-                  tap to activate
-                </div>
-              )}
+              tap to activate
             </div>
-          );
-        })}
+          )}
+        </div>
+        <div onClick={() => setActiveMprPanel(1)} style={mprPanelWrapperStyle(coronalActive)}>
+          {renderPlanePanel("coronal", coronalActive, "Coronal")}
+        </div>
+        <div onClick={() => setActiveMprPanel(2)} style={mprPanelWrapperStyle(sagittalActive)}>
+          {renderPlanePanel("sagittal", sagittalActive, "Sagittal")}
+        </div>
+        <div style={mprPanelWrapperStyle(false)}>{renderLocalizerPanel()}</div>
       </div>
     );
   };
@@ -889,6 +1229,8 @@ export default function ViewerPage() {
               onClick={() => {
                 setActiveSeries(i);
                 setCurrentSlice(1);
+                setCoronalSlice(null);
+                setSagittalSlice(null);
               }}
               style={{
                 flexShrink: 0,
@@ -950,6 +1292,15 @@ export default function ViewerPage() {
             {renderViewport("100%", "100%")}
           </div>
           {renderMissingDicomBadge()}
+
+          {!isMprMode && !!study.dicom_path && maxSlices > 1 && (
+            <SliceScrubber
+              currentSlice={currentSlice}
+              maxSlices={maxSlices}
+              onScrub={setCurrentSlice}
+              strip={localizerStrip}
+            />
+          )}
 
           {!isMprMode && (
             <>
@@ -1394,6 +1745,8 @@ export default function ViewerPage() {
               onClick={() => {
                 setActiveSeries(i);
                 setCurrentSlice(1);
+                setCoronalSlice(null);
+                setSagittalSlice(null);
               }}
               style={{
                 background: i === activeSeries ? "rgba(26,115,232,0.15)" : "transparent",
@@ -1459,6 +1812,16 @@ export default function ViewerPage() {
             </div>
           </div>
           {renderMissingDicomBadge()}
+
+          {!isMprMode && !!study.dicom_path && maxSlices > 1 && (
+            <SliceScrubber
+              currentSlice={currentSlice}
+              maxSlices={maxSlices}
+              onScrub={setCurrentSlice}
+              strip={localizerStrip}
+              rightOffset="64px"
+            />
+          )}
 
           {!isMprMode && (
             <>

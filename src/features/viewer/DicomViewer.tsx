@@ -201,7 +201,12 @@ export default function DicomViewer({
       }}
     >
       <img
-        key={src}
+        // No `key={src}` here on purpose: keying by src forces React to
+        // unmount/remount a brand-new <img> on every single slice change,
+        // which is what made scrolling feel janky (a flash of nothing +
+        // full relayout per slice). Keeping the same DOM node and just
+        // swapping `src` lets the browser paint the next frame from cache
+        // in place, which is what makes fast scrolling feel smooth.
         src={src}
         alt=""
         draggable={false}
