@@ -27,6 +27,16 @@ export interface DicomVolumeState {
 
 const volumeCache = new Map<string, DicomVolume>();
 
+// Reconstructed coronal/sagittal images are inherently limited by the
+// number of slices along one axis (often far fewer than the in-plane pixel
+// count), so decoding every slice at full native resolution just to throw
+// most of that detail away was the main reason building the volume felt
+// slow. Capping the in-plane size here cuts decode + getImageData/putImageData
+// cost roughly with the square of the scale factor, with no visible loss
+// for the reconstructed views (the true axial view still uses the
+// full-resolution preview directly, untouched by this).
+const MAX_VOLUME_DIM = 320;
+
 function partitionBySeries(
   fileList: string[],
   activeSeries: number,
@@ -93,10 +103,14 @@ export function useDicomVolume(
           throw new Error("No slices available to reconstruct this series");
         }
 
-        // First slice establishes the in-plane dimensions for the volume.
+        // First slice establishes the in-plane dimensions for the volume,
+        // scaled down to MAX_VOLUME_DIM on the longer edge.
         const firstImg = await loadImage(previewUrl(studyId, files[0]));
-        const width = firstImg.naturalWidth || 1;
-        const height = firstImg.naturalHeight || 1;
+        const nativeWidth = firstImg.naturalWidth || 1;
+        const nativeHeight = firstImg.naturalHeight || 1;
+        const scale = Math.min(1, MAX_VOLUME_DIM / Math.max(nativeWidth, nativeHeight));
+        const width = Math.max(1, Math.round(nativeWidth * scale));
+        const height = Math.max(1, Math.round(nativeHeight * scale));
         const depth = files.length;
 
         const data = new Uint8ClampedArray(width * height * depth);
@@ -110,6 +124,9 @@ export function useDicomVolume(
           ctx.clearRect(0, 0, width, height);
           // Slices are expected to share dimensions; if one doesn't, it's
           // stretched to fit rather than aborting the whole reconstruction.
+          // The browser's own bilinear downscale here also softens preview
+          // JPEG artifacts a little, which helps the reconstructed views
+          // look less blocky.
           ctx.drawImage(img, 0, 0, width, height);
           const frame = ctx.getImageData(0, 0, width, height).data;
           const base = z * width * height;
@@ -120,9 +137,21 @@ export function useDicomVolume(
 
         writeSlice(firstImg, 0);
         if (cancelledRef.current) return;
-        setState((s) => ({ ...s, progress: Math.round((1 / depth) * 100) }));
 
-        const CONCURRENCY = 6;
+        // Re-rendering React on every single slice (there can be hundreds)
+        // is itself a meaningful chunk of the perceived "loading forever" —
+        // only push a state update when the rounded percentage actually
+        // changes.
+        let lastReportedPct = 0;
+        const reportProgress = (z: number) => {
+          const pct = Math.round(((z + 1) / depth) * 100);
+          if (pct === lastReportedPct) return;
+          lastReportedPct = pct;
+          setState((s) => ({ ...s, progress: pct }));
+        };
+        reportProgress(0);
+
+        const CONCURRENCY = 8;
         let nextIndex = 1;
         const worker = async () => {
           while (!cancelledRef.current) {
@@ -131,10 +160,7 @@ export function useDicomVolume(
             const img = await loadImage(previewUrl(studyId, files[z]));
             if (cancelledRef.current) return;
             writeSlice(img, z);
-            setState((s) => ({
-              ...s,
-              progress: Math.round(((z + 1) / depth) * 100),
-            }));
+            reportProgress(z);
           }
         };
 

@@ -74,19 +74,20 @@ export default function ViewerPage() {
   const [isCinePlaying, setIsCinePlaying] = useState(false);
   const [isMprMode, setIsMprMode] = useState(false);
 
-  // ── MPR active panel (0=top-left/Axial, 1=top-right/Coronal,
-  //    2=bottom-left/Sagittal, 3=bottom-right/Active)
-  //    The active panel is interactive and tracks currentSlice.
-  //    Clicking any panel makes it active.
-  const [activeMprPanel, setActiveMprPanel] = useState(3);
-
   const cineIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Real DICOM file count reported back by DicomViewer.
   const [dicomFileCount, setDicomFileCount] = useState(0);
 
-  // ── Real MPR: reconstructed coronal/sagittal slice position ─────────────
-  // (1-based, like currentSlice, so the on-screen "n / max" labels line up)
+  // ── Real MPR: shared 3D cursor ───────────────────────────────────────────
+  // currentSlice (Z/axial), coronalSlice (Y) and sagittalSlice (X) together
+  // form ONE shared cursor into the volume. Every MPR pane reads this same
+  // cursor and draws a crosshair showing where the other two planes are
+  // currently cutting; clicking/dragging in any pane repositions the cursor
+  // and all three panes update live — this is the crosshair-linked
+  // navigation real MPR viewers use, rather than three independently
+  // scrollable but otherwise disconnected planes.
+  // (1-based, like currentSlice, so the on-screen "n / max" labels line up.)
   const [coronalSlice, setCoronalSlice] = useState<number | null>(null);
   const [sagittalSlice, setSagittalSlice] = useState<number | null>(null);
 
@@ -128,36 +129,10 @@ export default function ViewerPage() {
   offsetRef.current = offset;
   const zoomRef = useRef(zoom);
   zoomRef.current = zoom;
-  const isMprModeRef = useRef(isMprMode);
-  isMprModeRef.current = isMprMode;
-  const activeMprPanelRef = useRef(activeMprPanel);
-  activeMprPanelRef.current = activeMprPanel;
   const coronalMaxRef = useRef(coronalMax);
   coronalMaxRef.current = coronalMax;
   const sagittalMaxRef = useRef(sagittalMax);
   sagittalMaxRef.current = sagittalMax;
-
-  // Advances whichever plane is currently "active": the axial slice normally,
-  // or — in MPR mode — the coronal/sagittal cut position when one of those
-  // panels is the one selected. This is what makes each MPR pane genuinely
-  // independently scrollable through its own real reconstructed depth.
-  const advanceActiveSlice = (step: number) => {
-    if (isMprModeRef.current && activeMprPanelRef.current === 1) {
-      setCoronalSlice((s) => {
-        const cur = s ?? Math.ceil(coronalMaxRef.current / 2);
-        return Math.max(1, Math.min(coronalMaxRef.current, cur + step));
-      });
-      return;
-    }
-    if (isMprModeRef.current && activeMprPanelRef.current === 2) {
-      setSagittalSlice((s) => {
-        const cur = s ?? Math.ceil(sagittalMaxRef.current / 2);
-        return Math.max(1, Math.min(sagittalMaxRef.current, cur + step));
-      });
-      return;
-    }
-    setCurrentSlice((s) => Math.max(1, Math.min(maxSlicesRef.current, s + step)));
-  };
 
   const placeholderMaxSlices = study
     ? ((SERIES_MAP[study.modality] ?? SERIES_MAP.CT)[activeSeries]?.count ?? 1)
@@ -167,103 +142,171 @@ export default function ViewerPage() {
   const maxSlicesRef = useRef(maxSlicesForTouch);
   maxSlicesRef.current = maxSlicesForTouch;
 
+  // Each plane now scrolls its own axis independently — axial moves Z,
+  // coronal moves Y, sagittal moves X — instead of only whichever single
+  // panel used to be "active".
+  const stepAxial = (dir: number) =>
+    setCurrentSlice((s) => Math.max(1, Math.min(maxSlicesRef.current, s + dir)));
+  const stepCoronal = (dir: number) =>
+    setCoronalSlice((s) => {
+      const cur = s ?? Math.ceil(coronalMaxRef.current / 2);
+      return Math.max(1, Math.min(coronalMaxRef.current, cur + dir));
+    });
+  const stepSagittal = (dir: number) =>
+    setSagittalSlice((s) => {
+      const cur = s ?? Math.ceil(sagittalMaxRef.current / 2);
+      return Math.max(1, Math.min(sagittalMaxRef.current, cur + dir));
+    });
+
   const pinchStartDistRef = useRef<number | null>(null);
   const pinchStartZoomRef = useRef(1);
+  const touchDragStartRef = useRef({ x: 0, y: 0 });
+  const touchIsDraggingRef = useRef(false);
   // Trackpads fire dozens of tiny wheel events per swipe; stepping one slice
   // per raw event makes scrolling feel erratic. Accumulating delta and only
   // stepping once it crosses a threshold turns that into smooth, evenly
   // paced slice-per-distance scrolling regardless of input device.
-  const wheelAccumRef = useRef(0);
   const WHEEL_SLICE_THRESHOLD = 55;
-  const touchDragStartRef = useRef({ x: 0, y: 0 });
-  const touchIsDraggingRef = useRef(false);
-  const viewportCleanupRef = useRef<() => void>(() => {});
 
-  const setViewportRef = (el: HTMLDivElement | null) => {
-    viewportCleanupRef.current();
-    viewportCleanupRef.current = () => {};
-    if (!el) return;
+  // Builds a viewport ref-callback bound to one axis's step function, so
+  // axial/coronal/sagittal panes can each be scrolled independently at the
+  // same time (rather than only whichever single panel used to be "active").
+  const makeViewportRefSetter = (
+    wheelAccumRef: React.MutableRefObject<number>,
+    stepSlice: (dir: number) => void,
+  ) => {
+    let cleanup = () => {};
+    return (el: HTMLDivElement | null) => {
+      cleanup();
+      cleanup = () => {};
+      if (!el) return;
 
-    const getTouchDist = (touches: TouchList) => {
-      const a = touches[0];
-      const b = touches[1];
-      return Math.hypot(b.clientX - a.clientX, b.clientY - a.clientY);
-    };
+      const getTouchDist = (touches: TouchList) => {
+        const a = touches[0];
+        const b = touches[1];
+        return Math.hypot(b.clientX - a.clientX, b.clientY - a.clientY);
+      };
 
-    const onWheelNative = (e: WheelEvent) => {
-      if (activeToolRef.current === "zoom") {
-        e.preventDefault();
-        setZoom((z) => Math.min(3, Math.max(0.3, z - e.deltaY * 0.001)));
-        return;
-      }
-      e.preventDefault();
-      wheelAccumRef.current += e.deltaY;
-      while (Math.abs(wheelAccumRef.current) >= WHEEL_SLICE_THRESHOLD) {
-        const dir = wheelAccumRef.current > 0 ? 1 : -1;
-        advanceActiveSlice(dir);
-        wheelAccumRef.current -= dir * WHEEL_SLICE_THRESHOLD;
-      }
-    };
-
-    const onTouchStart = (e: TouchEvent) => {
-      if (e.touches.length === 2) {
-        pinchStartDistRef.current = getTouchDist(e.touches);
-        pinchStartZoomRef.current = zoomRef.current;
-      } else if (e.touches.length === 1) {
-        const t = e.touches[0];
-        touchDragStartRef.current = { x: t.clientX, y: t.clientY };
-        touchIsDraggingRef.current = true;
-      }
-    };
-
-    const onTouchMove = (e: TouchEvent) => {
-      if (e.touches.length === 2 && pinchStartDistRef.current) {
-        e.preventDefault();
-        const dist = getTouchDist(e.touches);
-        const ratio = dist / pinchStartDistRef.current;
-        setZoom(Math.min(3, Math.max(0.3, pinchStartZoomRef.current * ratio)));
-        return;
-      }
-      if (e.touches.length === 1 && touchIsDraggingRef.current) {
-        const t = e.touches[0];
-        if (activeToolRef.current === "pan") {
+      const onWheelNative = (e: WheelEvent) => {
+        if (activeToolRef.current === "zoom") {
           e.preventDefault();
-          const dx = t.clientX - touchDragStartRef.current.x;
-          const dy = t.clientY - touchDragStartRef.current.y;
-          setOffset({
-            x: offsetRef.current.x + dx,
-            y: offsetRef.current.y + dy,
-          });
+          setZoom((z) => Math.min(3, Math.max(0.3, z - e.deltaY * 0.001)));
+          return;
+        }
+        e.preventDefault();
+        wheelAccumRef.current += e.deltaY;
+        while (Math.abs(wheelAccumRef.current) >= WHEEL_SLICE_THRESHOLD) {
+          const dir = wheelAccumRef.current > 0 ? 1 : -1;
+          stepSlice(dir);
+          wheelAccumRef.current -= dir * WHEEL_SLICE_THRESHOLD;
+        }
+      };
+
+      const onTouchStart = (e: TouchEvent) => {
+        if (e.touches.length === 2) {
+          pinchStartDistRef.current = getTouchDist(e.touches);
+          pinchStartZoomRef.current = zoomRef.current;
+        } else if (e.touches.length === 1) {
+          const t = e.touches[0];
           touchDragStartRef.current = { x: t.clientX, y: t.clientY };
-        } else if (activeToolRef.current === "scroll") {
+          touchIsDraggingRef.current = true;
+        }
+      };
+
+      const onTouchMove = (e: TouchEvent) => {
+        if (e.touches.length === 2 && pinchStartDistRef.current) {
           e.preventDefault();
-          const dy = t.clientY - touchDragStartRef.current.y;
-          if (Math.abs(dy) > 12) {
-            advanceActiveSlice(dy < 0 ? 1 : -1);
+          const dist = getTouchDist(e.touches);
+          const ratio = dist / pinchStartDistRef.current;
+          setZoom(Math.min(3, Math.max(0.3, pinchStartZoomRef.current * ratio)));
+          return;
+        }
+        if (e.touches.length === 1 && touchIsDraggingRef.current) {
+          const t = e.touches[0];
+          if (activeToolRef.current === "pan") {
+            e.preventDefault();
+            const dx = t.clientX - touchDragStartRef.current.x;
+            const dy = t.clientY - touchDragStartRef.current.y;
+            setOffset({
+              x: offsetRef.current.x + dx,
+              y: offsetRef.current.y + dy,
+            });
             touchDragStartRef.current = { x: t.clientX, y: t.clientY };
+          } else if (activeToolRef.current === "scroll") {
+            e.preventDefault();
+            const dy = t.clientY - touchDragStartRef.current.y;
+            if (Math.abs(dy) > 12) {
+              stepSlice(dy < 0 ? 1 : -1);
+              touchDragStartRef.current = { x: t.clientX, y: t.clientY };
+            }
           }
         }
-      }
-    };
+      };
 
-    const onTouchEnd = () => {
-      pinchStartDistRef.current = null;
-      touchIsDraggingRef.current = false;
-    };
+      const onTouchEnd = () => {
+        pinchStartDistRef.current = null;
+        touchIsDraggingRef.current = false;
+      };
 
-    el.addEventListener("wheel", onWheelNative, { passive: false });
-    el.addEventListener("touchstart", onTouchStart, { passive: false });
-    el.addEventListener("touchmove", onTouchMove, { passive: false });
-    el.addEventListener("touchend", onTouchEnd, { passive: false });
-    el.addEventListener("touchcancel", onTouchEnd, { passive: false });
+      el.addEventListener("wheel", onWheelNative, { passive: false });
+      el.addEventListener("touchstart", onTouchStart, { passive: false });
+      el.addEventListener("touchmove", onTouchMove, { passive: false });
+      el.addEventListener("touchend", onTouchEnd, { passive: false });
+      el.addEventListener("touchcancel", onTouchEnd, { passive: false });
 
-    viewportCleanupRef.current = () => {
-      el.removeEventListener("wheel", onWheelNative);
-      el.removeEventListener("touchstart", onTouchStart);
-      el.removeEventListener("touchmove", onTouchMove);
-      el.removeEventListener("touchend", onTouchEnd);
-      el.removeEventListener("touchcancel", onTouchEnd);
+      cleanup = () => {
+        el.removeEventListener("wheel", onWheelNative);
+        el.removeEventListener("touchstart", onTouchStart);
+        el.removeEventListener("touchmove", onTouchMove);
+        el.removeEventListener("touchend", onTouchEnd);
+        el.removeEventListener("touchcancel", onTouchEnd);
+      };
     };
+  };
+
+  const axialWheelAccumRef = useRef(0);
+  const coronalWheelAccumRef = useRef(0);
+  const sagittalWheelAccumRef = useRef(0);
+  const setAxialViewportRef = makeViewportRefSetter(axialWheelAccumRef, stepAxial);
+  const setCoronalViewportRef = makeViewportRefSetter(coronalWheelAccumRef, stepCoronal);
+  const setSagittalViewportRef = makeViewportRefSetter(sagittalWheelAccumRef, stepSagittal);
+
+  // ── Crosshair math: screen click → fraction within the displayed image ──
+  // Inverts the same translate/scale(flip)/rotate transform used to render
+  // the image, so clicking/dragging on any MPR pane maps back to the right
+  // voxel regardless of current zoom/pan/rotation/flip.
+  const imagePointFraction = (
+    e: { clientX: number; clientY: number; currentTarget: EventTarget },
+    imageAspect: number,
+  ): { fx: number; fy: number } | null => {
+    const container = e.currentTarget as HTMLElement;
+    const rect = container.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return null;
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+
+    let dx = e.clientX - cx - offset.x;
+    let dy = e.clientY - cy - offset.y;
+    dx /= zoom * (flipH ? -1 : 1);
+    dy /= zoom * (flipV ? -1 : 1);
+
+    const rotationMod = ((rotation % 360) + 360) % 360;
+    if (rotationMod !== 0) {
+      const rad = (-rotationMod * Math.PI) / 180;
+      const rdx = dx * Math.cos(rad) - dy * Math.sin(rad);
+      const rdy = dx * Math.sin(rad) + dy * Math.cos(rad);
+      dx = rdx;
+      dy = rdy;
+    }
+
+    const containerAspect = rect.width / rect.height;
+    const containWidth = containerAspect > imageAspect ? rect.height * imageAspect : rect.width;
+    const containHeight = containerAspect > imageAspect ? rect.height : rect.width / imageAspect;
+
+    const fx = 0.5 + dx / containWidth;
+    const fy = 0.5 + dy / containHeight;
+    if (fx < 0 || fx > 1 || fy < 0 || fy > 1) return null;
+    return { fx, fy };
   };
 
   useEffect(() => {
@@ -298,9 +341,9 @@ export default function ViewerPage() {
         return;
       }
       if (e.key === "ArrowUp" || e.key === "ArrowRight") {
-        advanceActiveSlice(1);
+        stepAxial(1);
       } else if (e.key === "ArrowDown" || e.key === "ArrowLeft") {
-        advanceActiveSlice(-1);
+        stepAxial(-1);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -335,7 +378,6 @@ export default function ViewerPage() {
     if (toolId === "cine") setIsCinePlaying((p) => !p);
     if (toolId === "mpr") {
       setIsMprMode((m) => !m);
-      setActiveMprPanel(0); // reset to Axial when toggling MPR
     }
     if (toolId === "full") {
       if (!document.fullscreenElement) {
@@ -354,7 +396,6 @@ export default function ViewerPage() {
       setIsInverted(false);
       setIsCinePlaying(false);
       setIsMprMode(false);
-      setActiveMprPanel(0);
       setCoronalSlice(null);
       setSagittalSlice(null);
       setMeasurements([]);
@@ -596,15 +637,58 @@ export default function ViewerPage() {
     </svg>
   );
 
-  // ── Single-panel viewport ───────────────────────────────────────────────
-  const renderSinglePanel = (
-    w: string,
-    h: string,
-    sliceOverride?: number,
-    label?: string,
-  ) => {
-    const sliceForPanel = sliceOverride ?? currentSlice;
-    const isReadOnly = sliceOverride !== undefined;
+  // ── Crosshair overlay: shows where the OTHER two planes are cutting ─────
+  const renderCrosshair = (kind: "axial" | "coronal" | "sagittal") => {
+    if (!isMprMode || !volume) return null;
+    const sagFrac =
+      sagittalMax > 1 ? ((sagittalSlice ?? Math.ceil(sagittalMax / 2)) - 1) / (sagittalMax - 1) : 0.5;
+    const corFrac =
+      coronalMax > 1 ? ((coronalSlice ?? Math.ceil(coronalMax / 2)) - 1) / (coronalMax - 1) : 0.5;
+    const axFrac = maxSlices > 1 ? (currentSlice - 1) / (maxSlices - 1) : 0.5;
+
+    // Pink = sagittal cut position, cyan = coronal cut position, yellow =
+    // axial cut position — consistent per-axis coloring across all panes.
+    let vFrac: number, vColor: string, hFrac: number, hColor: string;
+    if (kind === "axial") {
+      vFrac = sagFrac; vColor = "#ec4899";
+      hFrac = corFrac; hColor = "#38bdf8";
+    } else if (kind === "coronal") {
+      vFrac = sagFrac; vColor = "#ec4899";
+      hFrac = axFrac; hColor = "#facc15";
+    } else {
+      vFrac = corFrac; vColor = "#38bdf8";
+      hFrac = axFrac; hColor = "#facc15";
+    }
+
+    const scaleX = zoom * (flipH ? -1 : 1);
+    const scaleY = zoom * (flipV ? -1 : 1);
+
+    return (
+      <svg
+        style={{
+          position: "absolute",
+          inset: 0,
+          width: "100%",
+          height: "100%",
+          pointerEvents: "none",
+          zIndex: 6,
+          transform: `translate(${offset.x}px, ${offset.y}px) scale(${scaleX}, ${scaleY}) rotate(${rotation}deg)`,
+          transformOrigin: "center center",
+        }}
+      >
+        <line x1={`${vFrac * 100}%`} y1="0" x2={`${vFrac * 100}%`} y2="100%" stroke={vColor} strokeWidth={1} strokeDasharray="5 4" opacity={0.85} />
+        <line x1="0" y1={`${hFrac * 100}%`} x2="100%" y2={`${hFrac * 100}%`} stroke={hColor} strokeWidth={1} strokeDasharray="5 4" opacity={0.85} />
+      </svg>
+    );
+  };
+
+  // ── Single-panel viewport (also the MPR axial pane) ─────────────────────
+  const renderSinglePanel = (w: string, h: string, label?: string) => {
+    // While in MPR mode, the default "pan" tool repositions the shared
+    // crosshair instead of panning the image — pure offset-panning isn't
+    // very meaningful inside a small orthogonal pane anyway, and this is
+    // what makes clicking/dragging any MPR pane move the other two.
+    const isCrosshair = isMprMode && activeTool === "pan";
 
     const localPoint = (e: React.MouseEvent): Point => {
       const rect = e.currentTarget.getBoundingClientRect();
@@ -624,8 +708,16 @@ export default function ViewerPage() {
       setHoverPoint(null);
     };
 
+    const updateCrosshairFromEvent = (e: React.MouseEvent) => {
+      if (!volume) return;
+      const frac = imagePointFraction(e, volume.width / volume.height);
+      if (!frac) return;
+      setSagittalSlice(Math.round(frac.fx * (volume.width - 1)) + 1);
+      setCoronalSlice(Math.round(frac.fy * (volume.height - 1)) + 1);
+    };
+
     const handleViewportClick = (e: React.MouseEvent) => {
-      if (isReadOnly) return;
+      if (isCrosshair) return; // handled on mouse down/move instead
       if (!isMeasurementTool(activeTool)) return;
       const p = localPoint(e);
       const next = [...pendingPoints, p];
@@ -641,7 +733,6 @@ export default function ViewerPage() {
     };
 
     const handleDoubleClick = (e: React.MouseEvent) => {
-      if (isReadOnly) return;
       if (activeTool === "area" && pendingPoints.length >= 3) {
         e.preventDefault();
         finishMeasurement("area", pendingPoints);
@@ -649,7 +740,11 @@ export default function ViewerPage() {
     };
 
     const handleMouseDown = (e: React.MouseEvent) => {
-      if (isReadOnly) return;
+      if (isCrosshair) {
+        setIsDragging(true);
+        updateCrosshairFromEvent(e);
+        return;
+      }
       if (isMeasurementTool(activeTool)) return;
       if (activeTool === "pan") {
         setIsDragging(true);
@@ -665,7 +760,10 @@ export default function ViewerPage() {
     };
 
     const handleMouseMove = (e: React.MouseEvent) => {
-      if (isReadOnly) return;
+      if (isCrosshair) {
+        if (isDragging) updateCrosshairFromEvent(e);
+        return;
+      }
       if (isMeasurementTool(activeTool) && pendingPoints.length > 0) {
         setHoverPoint(localPoint(e));
       }
@@ -681,7 +779,7 @@ export default function ViewerPage() {
       } else if (activeTool === "scroll") {
         const dy = e.clientY - dragStart.y;
         if (Math.abs(dy) > 8) {
-          advanceActiveSlice(dy > 0 ? 1 : -1);
+          stepAxial(dy > 0 ? 1 : -1);
           setDragStart({ x: e.clientX, y: e.clientY });
         }
       } else if (activeTool === "zoom") {
@@ -695,8 +793,8 @@ export default function ViewerPage() {
 
     const handleMouseUp = () => setIsDragging(false);
 
-    const cursor = isReadOnly
-      ? "pointer"
+    const cursor = isCrosshair
+      ? "crosshair"
       : isMeasurementTool(activeTool)
         ? "crosshair"
         : activeTool === "pan"
@@ -732,14 +830,12 @@ export default function ViewerPage() {
           flipH={flipH}
           flipV={flipV}
           isInverted={isInverted}
-          imageIndex={sliceForPanel - 1}
+          imageIndex={currentSlice - 1}
           offsetX={offset.x}
           offsetY={offset.y}
           activeSeries={activeSeries}
           seriesCount={series.length}
-          onFileCountChange={
-            sliceOverride === undefined ? setDicomFileCount : undefined
-          }
+          onFileCountChange={setDicomFileCount}
         />
       </div>
     ) : (
@@ -762,7 +858,7 @@ export default function ViewerPage() {
 
     return (
       <div
-        ref={!isReadOnly ? setViewportRef : undefined}
+        ref={setAxialViewportRef}
         style={{
           width: w,
           height: h,
@@ -779,6 +875,7 @@ export default function ViewerPage() {
         onMouseLeave={handleMouseUp}
       >
         {inner}
+        {renderCrosshair("axial")}
         {label && (
           <div
             style={{
@@ -798,32 +895,27 @@ export default function ViewerPage() {
             {label}
           </div>
         )}
-        {!isReadOnly && renderMeasurementOverlay()}
+        {renderMeasurementOverlay()}
       </div>
     );
   };
 
-  // ── MPR panel chrome (border highlight for whichever pane is active) ────
-  const mprPanelWrapperStyle = (isActive: boolean): React.CSSProperties => ({
+  // ── MPR panel chrome ─────────────────────────────────────────────────────
+  const mprPanelWrapperStyle: React.CSSProperties = {
     background: "#000",
-    border: `2px solid ${isActive ? "#1A73E8" : "#333"}`,
+    border: "2px solid #333",
     overflow: "hidden",
     position: "relative",
-    cursor: isActive ? "default" : "pointer",
     boxSizing: "border-box",
-  });
+  };
 
   // ── Reconstructed coronal/sagittal panel ────────────────────────────────
-  // Unlike the old MPR mode (which just showed three axial slices at
-  // different depths under misleading labels), this actually resamples the
-  // volume built by useDicomVolume along the coronal/sagittal axis, so each
-  // pane shows a genuinely different orthogonal cut of the same anatomy.
-  const renderPlanePanel = (
-    plane: "coronal" | "sagittal",
-    isActive: boolean,
-    label: string,
-  ) => {
-    const isReadOnly = !isActive;
+  // Resamples the volume built by useDicomVolume along the coronal/sagittal
+  // axis, so each pane shows a genuinely different orthogonal cut of the
+  // same anatomy — and, like the axial pane, clicking/dragging with the
+  // default "pan" tool repositions the shared crosshair, live-updating the
+  // other two panes.
+  const renderPlanePanel = (plane: "coronal" | "sagittal", label: string) => {
     const sliceMax = plane === "coronal" ? coronalMax : sagittalMax;
     const sliceValue =
       (plane === "coronal" ? coronalSlice : sagittalSlice) ??
@@ -834,6 +926,8 @@ export default function ViewerPage() {
         ? reconstructCoronal(volume, sliceValue - 1)
         : reconstructSagittal(volume, sliceValue - 1)
       : null;
+
+    const isCrosshair = activeTool === "pan";
 
     const localPoint = (e: React.MouseEvent): Point => {
       const rect = e.currentTarget.getBoundingClientRect();
@@ -853,8 +947,22 @@ export default function ViewerPage() {
       setHoverPoint(null);
     };
 
+    const updateCrosshairFromEvent = (e: React.MouseEvent) => {
+      if (!volume) return;
+      const aspect = plane === "coronal" ? volume.width / volume.depth : volume.height / volume.depth;
+      const frac = imagePointFraction(e, aspect);
+      if (!frac) return;
+      const z = Math.max(1, Math.min(maxSlicesRef.current, Math.round(frac.fy * (volume.depth - 1)) + 1));
+      if (plane === "coronal") {
+        setSagittalSlice(Math.round(frac.fx * (volume.width - 1)) + 1);
+      } else {
+        setCoronalSlice(Math.round(frac.fx * (volume.height - 1)) + 1);
+      }
+      setCurrentSlice(z);
+    };
+
     const handleViewportClick = (e: React.MouseEvent) => {
-      if (isReadOnly) return;
+      if (isCrosshair) return;
       if (!isMeasurementTool(activeTool)) return;
       const p = localPoint(e);
       const next = [...pendingPoints, p];
@@ -870,7 +978,6 @@ export default function ViewerPage() {
     };
 
     const handleDoubleClick = (e: React.MouseEvent) => {
-      if (isReadOnly) return;
       if (activeTool === "area" && pendingPoints.length >= 3) {
         e.preventDefault();
         finishMeasurement("area", pendingPoints);
@@ -878,30 +985,28 @@ export default function ViewerPage() {
     };
 
     const handleMouseDown = (e: React.MouseEvent) => {
-      if (isReadOnly) return;
-      if (isMeasurementTool(activeTool)) return;
-      if (activeTool === "pan") {
+      if (isCrosshair) {
         setIsDragging(true);
-        setDragStart({ x: e.clientX - offset.x, y: e.clientY - offset.y });
-      } else if (
-        activeTool === "wl" ||
-        activeTool === "scroll" ||
-        activeTool === "zoom"
-      ) {
+        updateCrosshairFromEvent(e);
+        return;
+      }
+      if (isMeasurementTool(activeTool)) return;
+      if (activeTool === "wl" || activeTool === "scroll" || activeTool === "zoom") {
         setIsDragging(true);
         setDragStart({ x: e.clientX, y: e.clientY });
       }
     };
 
     const handleMouseMove = (e: React.MouseEvent) => {
-      if (isReadOnly) return;
+      if (isCrosshair) {
+        if (isDragging) updateCrosshairFromEvent(e);
+        return;
+      }
       if (isMeasurementTool(activeTool) && pendingPoints.length > 0) {
         setHoverPoint(localPoint(e));
       }
       if (!isDragging) return;
-      if (activeTool === "pan") {
-        setOffset({ x: e.clientX - dragStart.x, y: e.clientY - dragStart.y });
-      } else if (activeTool === "wl") {
+      if (activeTool === "wl") {
         const dy = e.clientY - dragStart.y;
         if (Math.abs(dy) > 1) {
           setBrightness((b) => Math.max(0.1, Math.min(2.5, b - dy * 0.005)));
@@ -910,7 +1015,7 @@ export default function ViewerPage() {
       } else if (activeTool === "scroll") {
         const dy = e.clientY - dragStart.y;
         if (Math.abs(dy) > 8) {
-          advanceActiveSlice(dy > 0 ? 1 : -1);
+          (plane === "coronal" ? stepCoronal : stepSagittal)(dy > 0 ? 1 : -1);
           setDragStart({ x: e.clientX, y: e.clientY });
         }
       } else if (activeTool === "zoom") {
@@ -924,23 +1029,19 @@ export default function ViewerPage() {
 
     const handleMouseUp = () => setIsDragging(false);
 
-    const cursor = isReadOnly
-      ? "pointer"
+    const cursor = isCrosshair
+      ? "crosshair"
       : isMeasurementTool(activeTool)
         ? "crosshair"
-        : activeTool === "pan"
-          ? isDragging
-            ? "grabbing"
-            : "grab"
-          : activeTool === "zoom"
-            ? "zoom-in"
-            : activeTool === "wl" || activeTool === "scroll"
-              ? "ns-resize"
-              : "default";
+        : activeTool === "zoom"
+          ? "zoom-in"
+          : activeTool === "wl" || activeTool === "scroll"
+            ? "ns-resize"
+            : "default";
 
     return (
       <div
-        ref={isActive ? setViewportRef : undefined}
+        ref={plane === "coronal" ? setCoronalViewportRef : setSagittalViewportRef}
         style={{
           width: "100%",
           height: "100%",
@@ -994,6 +1095,7 @@ export default function ViewerPage() {
             )}
           </div>
         )}
+        {renderCrosshair(plane)}
         <div
           style={{
             position: "absolute",
@@ -1011,97 +1113,42 @@ export default function ViewerPage() {
         >
           {label} · {sliceValue}/{sliceMax}
         </div>
-        {!isActive && (
-          <div
-            style={{
-              position: "absolute",
-              bottom: 4,
-              right: 6,
-              fontSize: "9px",
-              fontFamily: "monospace",
-              color: "rgba(255,255,255,0.35)",
-              pointerEvents: "none",
-            }}
-          >
-            tap to activate
-          </div>
-        )}
-        {isActive && renderMeasurementOverlay()}
+        {renderMeasurementOverlay()}
       </div>
     );
   };
 
-  // ── Localizer panel (bottom-right) ──────────────────────────────────────
-  // A read-only reference view of the axial slice with crosshair lines
-  // showing where the coronal and sagittal panes are currently cutting
-  // through the volume — standard PACS MPR chrome, and a much more honest
-  // use of the 4th quadrant than duplicating the axial pane under a
-  // different label.
-  const renderLocalizerPanel = () => {
-    const yFrac = coronalMax > 1 ? (coronalSlice ?? coronalMax / 2) / coronalMax : 0.5;
-    const xFrac = sagittalMax > 1 ? (sagittalSlice ?? sagittalMax / 2) / sagittalMax : 0.5;
+  // ── 4th quadrant placeholder ─────────────────────────────────────────────
+  // True 3D volume rendering (GPU raycasting) and freeform oblique-angle
+  // reformation are a much bigger follow-up feature — this quadrant used to
+  // just duplicate the axial pane under a "Localizer" label (redundant now
+  // that axial itself shows the crosshair), so it's an honest placeholder
+  // instead of a fake panel.
+  const render3dPlaceholder = () => (
+    <div
+      style={{
+        width: "100%",
+        height: "100%",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        flexDirection: "column",
+        gap: 6,
+        color: "#4b5563",
+        fontSize: 11,
+        fontFamily: "monospace",
+        textAlign: "center",
+        padding: 12,
+      }}
+    >
+      <span>3D volume rendering</span>
+      <span style={{ fontSize: 10, color: "#374151" }}>coming soon</span>
+    </div>
+  );
 
-    return (
-      <div style={{ width: "100%", height: "100%", position: "relative" }}>
-        {renderSinglePanel("100%", "100%", currentSlice)}
-        {volume && (
-          <svg
-            style={{
-              position: "absolute",
-              inset: 0,
-              width: "100%",
-              height: "100%",
-              pointerEvents: "none",
-            }}
-          >
-            <line
-              x1="0"
-              y1={`${yFrac * 100}%`}
-              x2="100%"
-              y2={`${yFrac * 100}%`}
-              stroke="#facc15"
-              strokeWidth={1}
-              strokeDasharray="4 3"
-            />
-            <line
-              x1={`${xFrac * 100}%`}
-              y1="0"
-              x2={`${xFrac * 100}%`}
-              y2="100%"
-              stroke="#facc15"
-              strokeWidth={1}
-              strokeDasharray="4 3"
-            />
-          </svg>
-        )}
-        <div
-          style={{
-            position: "absolute",
-            top: 6,
-            left: 6,
-            fontSize: "10px",
-            fontFamily: "monospace",
-            color: "#93c5fd",
-            background: "rgba(0,0,0,0.55)",
-            padding: "2px 6px",
-            borderRadius: "4px",
-            pointerEvents: "none",
-            zIndex: 5,
-          }}
-        >
-          Localizer · {currentSlice}/{maxSlices}
-        </div>
-      </div>
-    );
-  };
-
-  // ── Viewport: single panel OR 2×2 real MPR quad ─────────────────────────
+  // ── Viewport: single panel OR 2×2 real, crosshair-linked MPR quad ───────
   const renderViewport = (w: string, h: string) => {
     if (!isMprMode) return renderSinglePanel(w, h);
-
-    const axialActive = activeMprPanel === 0;
-    const coronalActive = activeMprPanel === 1;
-    const sagittalActive = activeMprPanel === 2;
 
     return (
       <div
@@ -1115,36 +1162,12 @@ export default function ViewerPage() {
           background: "#1a1a1a",
         }}
       >
-        <div onClick={() => setActiveMprPanel(0)} style={mprPanelWrapperStyle(axialActive)}>
-          {renderSinglePanel(
-            "100%",
-            "100%",
-            axialActive ? undefined : currentSlice,
-            `Axial · ${currentSlice}/${maxSlices}`,
-          )}
-          {!axialActive && (
-            <div
-              style={{
-                position: "absolute",
-                bottom: 4,
-                right: 6,
-                fontSize: "9px",
-                fontFamily: "monospace",
-                color: "rgba(255,255,255,0.35)",
-                pointerEvents: "none",
-              }}
-            >
-              tap to activate
-            </div>
-          )}
+        <div style={mprPanelWrapperStyle}>
+          {renderSinglePanel("100%", "100%", `Axial · ${currentSlice}/${maxSlices}`)}
         </div>
-        <div onClick={() => setActiveMprPanel(1)} style={mprPanelWrapperStyle(coronalActive)}>
-          {renderPlanePanel("coronal", coronalActive, "Coronal")}
-        </div>
-        <div onClick={() => setActiveMprPanel(2)} style={mprPanelWrapperStyle(sagittalActive)}>
-          {renderPlanePanel("sagittal", sagittalActive, "Sagittal")}
-        </div>
-        <div style={mprPanelWrapperStyle(false)}>{renderLocalizerPanel()}</div>
+        <div style={mprPanelWrapperStyle}>{renderPlanePanel("coronal", "Coronal")}</div>
+        <div style={mprPanelWrapperStyle}>{renderPlanePanel("sagittal", "Sagittal")}</div>
+        <div style={mprPanelWrapperStyle}>{render3dPlaceholder()}</div>
       </div>
     );
   };

@@ -77,7 +77,12 @@ export default function ReconstructedPlaneCanvas({
           maxHeight: "100%",
           objectFit: "contain",
           display: "block",
-          imageRendering: "pixelated",
+          // Unlike the true axial preview (kept pixel-sharp on purpose),
+          // this canvas is a coarse reconstruction — often just a few
+          // hundred pixels along the depth axis — stretched to fill the
+          // panel. Smooth interpolation here looks like a proper
+          // reformatted image instead of a blown-up pixel grid.
+          imageRendering: "auto",
           transform: `translate(${offsetX}px, ${offsetY}px) scale(${scaleX}, ${scaleY}) rotate(${rotation}deg)`,
           transformOrigin: "center center",
         }}

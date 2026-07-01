@@ -1,6 +1,7 @@
 import asyncio
 import io
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -279,21 +280,84 @@ async def get_study(
     return study
 
 
+_NATURAL_SPLIT_RE = re.compile(r"(\d+)")
+
+
+def _natural_key(name: str) -> list:
+    """Numeric-aware fallback so at least filenames like IM1/IM2/IM10 sort
+    in the order a human (or a scanner) would expect, when no DICOM header
+    ordering is available at all."""
+    return [int(tok) if tok.isdigit() else tok.lower() for tok in _NATURAL_SPLIT_RE.split(name)]
+
+
+def _dicom_sort_key(path: str) -> tuple:
+    """Real acquisition order, not filename order.
+
+    Plain lexicographic sort() on filenames scrambles unpadded numeric names
+    (IM1, IM10, IM100, ..., IM2, IM20, ...) into something that isn't the
+    true slice sequence. That's fine for viewing one axial slice at a time,
+    but it corrupts anything that stacks slices along Z — which is exactly
+    what the coronal/sagittal MPR reconstruction does, producing the
+    banded/interlaced look. Sort on DICOM InstanceNumber first (what the
+    scanner actually assigned), falling back to slice position, then to a
+    natural filename sort as a last resort for non-conformant files.
+    """
+    try:
+        ds = dcmread(path, stop_before_pixels=True, force=True)
+        instance_number = getattr(ds, "InstanceNumber", None)
+        if instance_number is not None:
+            return (0, int(instance_number))
+        slice_location = getattr(ds, "SliceLocation", None)
+        if slice_location is not None:
+            return (1, float(slice_location))
+        position = getattr(ds, "ImagePositionPatient", None)
+        if position is not None and len(position) == 3:
+            return (1, float(position[2]))
+    except Exception:
+        pass
+    return (2, _natural_key(os.path.basename(path)))
+
+
+# Per-process cache of sorted order, keyed by folder and auto-invalidated
+# whenever the folder's mtime changes (i.e. files were added/removed) —
+# avoids re-parsing every DICOM header on every page load/poll.
+_FILE_ORDER_CACHE: dict[str, tuple[float, list[str]]] = {}
+
+
+def _sorted_dicom_files(folder: str) -> list[str]:
+    try:
+        dir_mtime = os.path.getmtime(folder)
+    except OSError:
+        dir_mtime = 0.0
+
+    cached = _FILE_ORDER_CACHE.get(folder)
+    if cached and cached[0] == dir_mtime:
+        return cached[1]
+
+    names = [
+        f for f in os.listdir(folder)
+        if os.path.isfile(os.path.join(folder, f)) and not f.startswith("__tmp_")
+    ]
+    names.sort(key=lambda f: _dicom_sort_key(os.path.join(folder, f)))
+    _FILE_ORDER_CACHE[folder] = (dir_mtime, names)
+    return names
+
+
 @router.get("/{study_id}/files")
 async def list_study_files(
     study_id: UUID,
     svc: StudyService = Depends(get_service),
 ):
-    """Returns sorted filenames so the viewer can build full WADO URLs."""
+    """Returns filenames in true acquisition order (DICOM InstanceNumber /
+    SliceLocation), not filename order, so the viewer can build full WADO
+    URLs and reliably stack slices for MPR reconstruction."""
     study = await svc.get(study_id)
     if not study:
         raise HTTPException(status_code=404, detail="Study not found")
     if not study.dicom_path or not os.path.isdir(study.dicom_path):
         return {"files": []}
-    files = sorted(
-        f for f in os.listdir(study.dicom_path)
-        if os.path.isfile(os.path.join(study.dicom_path, f)) and not f.startswith("__tmp_")
-    )
+    loop = asyncio.get_event_loop()
+    files = await loop.run_in_executor(None, _sorted_dicom_files, study.dicom_path)
     return {"files": files}
 
 
