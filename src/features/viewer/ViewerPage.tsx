@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import { useParams, useNavigate, useSearchParams } from "react-router-dom";
 import {
   ArrowLeft,
@@ -21,7 +21,11 @@ import { StudyInfoPanel } from "./components/StudyInfoPanel";
 import { DiscussionPanel } from "./components/DiscussionPanel";
 import DicomViewer from "./DicomViewer";
 import { useDicomVolume } from "./components/useDicomVolume";
-import { reconstructCoronal, reconstructSagittal } from "./components/reconstructPlane";
+import {
+  reconstructCoronal,
+  reconstructSagittal,
+  reconstructCoronalMIP,
+} from "./components/reconstructPlane";
 import ReconstructedPlaneCanvas from "./components/ReconstructedPlaneCanvas";
 import { useLocalizerStrip } from "./components/useLocalizerStrip";
 import SliceScrubber from "./components/SliceScrubber";
@@ -106,6 +110,16 @@ export default function ViewerPage() {
   );
   const coronalMax = volume?.height ?? 1;
   const sagittalMax = volume?.width ?? 1;
+
+  // Coronal MIP (Maximum Intensity Projection) for the 4th quadrant — a real
+  // 3D-derived rendering using the whole volume at once (classic "see
+  // through" bone/vessel look), and much lighter than full GPU raycasting.
+  // Recomputed only when the volume itself changes, not on every slice
+  // scroll, since it's an O(width*height*depth) scan.
+  const mipImage = useMemo(
+    () => (volume ? reconstructCoronalMIP(volume) : null),
+    [volume],
+  );
 
   // Cheap, always-on position indicator for the slice scrubber — sampled
   // from a bounded number of slices, so unlike the full MPR volume this
@@ -836,6 +850,7 @@ export default function ViewerPage() {
           activeSeries={activeSeries}
           seriesCount={series.length}
           onFileCountChange={setDicomFileCount}
+          suppressBackgroundPrefetch={isMprMode}
         />
       </div>
     ) : (
@@ -1118,31 +1133,61 @@ export default function ViewerPage() {
     );
   };
 
-  // ── 4th quadrant placeholder ─────────────────────────────────────────────
-  // True 3D volume rendering (GPU raycasting) and freeform oblique-angle
-  // reformation are a much bigger follow-up feature — this quadrant used to
-  // just duplicate the axial pane under a "Localizer" label (redundant now
-  // that axial itself shows the crosshair), so it's an honest placeholder
-  // instead of a fake panel.
-  const render3dPlaceholder = () => (
-    <div
-      style={{
-        width: "100%",
-        height: "100%",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        flexDirection: "column",
-        gap: 6,
-        color: "#4b5563",
-        fontSize: 11,
-        fontFamily: "monospace",
-        textAlign: "center",
-        padding: 12,
-      }}
-    >
-      <span>3D volume rendering</span>
-      <span style={{ fontSize: 10, color: "#374151" }}>coming soon</span>
+  // ── 4th quadrant: MIP (a real 3D-derived render, not a placeholder) ─────
+  // Full rotatable GPU volume rendering + freeform oblique planes remain a
+  // bigger follow-up, but a Maximum Intensity Projection is a real,
+  // standard "3D" radiology view computed from the same volume already in
+  // memory — no reason to leave this quadrant fake in the meantime.
+  const render3dPanel = () => (
+    <div style={{ width: "100%", height: "100%", position: "relative" }}>
+      <ReconstructedPlaneCanvas
+        plane={mipImage}
+        brightness={brightness}
+        isInverted={isInverted}
+        zoom={1}
+        rotation={0}
+        flipH={false}
+        flipV={false}
+        offsetX={0}
+        offsetY={0}
+      />
+      {!mipImage && (
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            flexDirection: "column",
+            gap: 6,
+            color: volumeError ? "#ef4444" : "#6b7280",
+            fontSize: 10,
+            fontFamily: "monospace",
+            textAlign: "center",
+            padding: 12,
+          }}
+        >
+          {volumeError ? <span>{volumeError}</span> : <span>Building projection…</span>}
+        </div>
+      )}
+      <div
+        style={{
+          position: "absolute",
+          top: 6,
+          left: 6,
+          fontSize: "10px",
+          fontFamily: "monospace",
+          color: "#93c5fd",
+          background: "rgba(0,0,0,0.55)",
+          padding: "2px 6px",
+          borderRadius: "4px",
+          pointerEvents: "none",
+          zIndex: 5,
+        }}
+      >
+        3D · MIP projection
+      </div>
     </div>
   );
 
@@ -1167,7 +1212,7 @@ export default function ViewerPage() {
         </div>
         <div style={mprPanelWrapperStyle}>{renderPlanePanel("coronal", "Coronal")}</div>
         <div style={mprPanelWrapperStyle}>{renderPlanePanel("sagittal", "Sagittal")}</div>
-        <div style={mprPanelWrapperStyle}>{render3dPlaceholder()}</div>
+        <div style={mprPanelWrapperStyle}>{render3dPanel()}</div>
       </div>
     );
   };

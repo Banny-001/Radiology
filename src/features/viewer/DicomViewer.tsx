@@ -24,6 +24,10 @@ interface DicomViewerProps {
   seriesCount?: number;
   onFileCountChange?: (count: number) => void;
   onImageIndexChange?: (index: number) => void;
+  /** Skip the full-series background prefetch below. Set this while MPR
+   * mode's volume builder is already fetching every slice in the series —
+   * running both at once was doubling network requests for no benefit. */
+  suppressBackgroundPrefetch?: boolean;
 }
 
 export default function DicomViewer({
@@ -38,6 +42,7 @@ export default function DicomViewer({
   activeSeries = 0,
   seriesCount = 1,
   onFileCountChange,
+  suppressBackgroundPrefetch = false,
 }: DicomViewerProps) {
   const [fileList, setFileList] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -97,6 +102,7 @@ export default function DicomViewer({
   // Near slices load first so scrolling feels instant across the whole study.
   useEffect(() => {
     if (seriesFileList.length <= 1) return;
+    if (suppressBackgroundPrefetch) return;
 
     const key = `${studyId}-${activeSeries}`;
     if (prefetchKeyRef.current === key) return; // already running for this series
@@ -144,7 +150,7 @@ export default function DicomViewer({
     return () => {
       cancelled = true;
     };
-  }, [studyId, activeSeries, seriesFileList.length]); // eslint-disable-line
+  }, [studyId, activeSeries, seriesFileList.length, suppressBackgroundPrefetch]); // eslint-disable-line
 
   // ── Error state ────────────────────────────────────────────────────────
   if (error) {

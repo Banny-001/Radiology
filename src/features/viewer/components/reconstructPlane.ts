@@ -46,3 +46,29 @@ export function reconstructSagittal(volume: DicomVolume, xIndex: number): PlaneI
   }
   return { width: height, height: depth, pixels };
 }
+
+/**
+ * Coronal Maximum Intensity Projection: instead of cutting at one fixed Y,
+ * this looks straight through the whole volume (max value along Y at every
+ * X/Z) — the classic "see-through" projection used for bone/vessel MIPs.
+ * It's a real 3D-derived rendering using the whole volume at once, and a
+ * much lighter lift than full GPU raycasting (which remains a bigger
+ * follow-up for true rotatable volume rendering).
+ */
+export function reconstructCoronalMIP(volume: DicomVolume): PlaneImage {
+  const { width, height, depth, data } = volume;
+  const pixels = new Uint8ClampedArray(width * depth);
+  for (let z = 0; z < depth; z++) {
+    const sliceBase = z * width * height;
+    const rowOut = z * width;
+    for (let x = 0; x < width; x++) {
+      let maxV = 0;
+      for (let y = 0; y < height; y++) {
+        const v = data[sliceBase + y * width + x];
+        if (v > maxV) maxV = v;
+      }
+      pixels[rowOut + x] = maxV;
+    }
+  }
+  return { width, height: depth, pixels };
+}

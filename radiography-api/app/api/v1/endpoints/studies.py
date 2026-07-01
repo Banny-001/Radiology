@@ -90,7 +90,68 @@ def _count_dicom_like_files(folder: str) -> int:
     return count
 
 
-def _dicom_to_jpeg(file_path: str, wc: float | None, ww: float | None, quality: int) -> bytes:
+_WINDOW_CACHE: dict[str, tuple[float, tuple[float, float]]] = {}
+_WINDOW_SAMPLE_COUNT = 12
+
+
+def _folder_auto_window(folder: str) -> tuple[float, float]:
+    """One auto-window (wc, ww) for the whole series, not one per slice.
+
+    Letting every slice compute its own 2nd-98th-percentile window
+    independently is what produced the banded/interlaced look in the
+    coronal/sagittal MPR reconstructions: each column of the reconstructed
+    image comes from a different slice, and if every slice picked its own
+    contrast stretch, neighboring columns show a visible brightness seam.
+    Sampling a handful of slices and pooling their rescaled pixel values
+    into one shared window keeps every slice in a series on the same
+    contrast scale. Cached per folder (auto-invalidated on mtime change,
+    same scheme as the file-order cache) so this only runs once per series.
+    """
+    try:
+        dir_mtime = os.path.getmtime(folder)
+    except OSError:
+        dir_mtime = 0.0
+    cached = _WINDOW_CACHE.get(folder)
+    if cached and cached[0] == dir_mtime:
+        return cached[1]
+
+    files = _sorted_dicom_files(folder)
+    if not files:
+        return (40.0, 400.0)  # reasonable CT soft-tissue fallback
+
+    step = max(1, len(files) // _WINDOW_SAMPLE_COUNT)
+    sample_files = files[::step][:_WINDOW_SAMPLE_COUNT]
+
+    pooled: list[np.ndarray] = []
+    for fname in sample_files:
+        try:
+            ds = dcmread(os.path.join(folder, fname))
+            pix = ds.pixel_array.astype(np.float32)
+            slope = float(getattr(ds, "RescaleSlope", 1) or 1)
+            intercept = float(getattr(ds, "RescaleIntercept", 0) or 0)
+            pix = pix * slope + intercept
+            pooled.append(pix.reshape(-1))
+        except Exception:
+            continue
+
+    if not pooled:
+        return (40.0, 400.0)
+
+    all_pixels = np.concatenate(pooled)
+    lo_pct, hi_pct = np.percentile(all_pixels, [2, 98])
+    wc = float((lo_pct + hi_pct) / 2)
+    ww = float(max(hi_pct - lo_pct, 1))
+    _WINDOW_CACHE[folder] = (dir_mtime, (wc, ww))
+    return (wc, ww)
+
+
+def _dicom_to_jpeg(
+    file_path: str,
+    wc: float | None,
+    ww: float | None,
+    quality: int,
+    folder: str | None = None,
+) -> bytes:
     """Read a DICOM file and return JPEG bytes.
     Applies RescaleSlope/Intercept + window/level → 8-bit → JPEG.
     Result is ~30-60 KB instead of 529 KB raw DICOM = 10× smaller.
@@ -111,8 +172,13 @@ def _dicom_to_jpeg(file_path: str, wc: float | None, ww: float | None, quality: 
             # Some DICOMs store these as sequences
             wc = float(dicom_wc[0] if hasattr(dicom_wc, "__len__") else dicom_wc)
             ww = float(dicom_ww[0] if hasattr(dicom_ww, "__len__") else dicom_ww)
+        elif folder is not None:
+            # Series-consistent auto-window (see _folder_auto_window) —
+            # NOT a per-slice percentile, which is what caused the banding.
+            wc, ww = _folder_auto_window(folder)
         else:
-            # Auto-window from 2nd–98th percentile
+            # No folder context (e.g. a standalone call) — fall back to
+            # this single slice's own percentile as a last resort.
             lo_pct, hi_pct = np.percentile(pixels, [2, 98])
             wc = float((lo_pct + hi_pct) / 2)
             ww = float(max(hi_pct - lo_pct, 1))
@@ -425,7 +491,7 @@ async def serve_dicom_preview(
 
     loop = asyncio.get_event_loop()
     jpeg_bytes: bytes = await loop.run_in_executor(
-        None, _dicom_to_jpeg, file_path, wc, ww, quality
+        None, _dicom_to_jpeg, file_path, wc, ww, quality, study.dicom_path
     )
 
     return StreamingResponse(
