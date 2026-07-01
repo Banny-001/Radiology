@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { useParams, useNavigate, useSearchParams } from "react-router-dom";
 import {
   ArrowLeft,
@@ -203,6 +203,54 @@ export default function ViewerPage() {
     };
   }, [study?.id, study?.dicom_path, scoutSeriesIndex]);
 
+  // Neighbour prefetch for the reconstructed planes — mirrors the axial
+  // pane's own ±5-neighbour preload in DicomViewer.tsx. Without this, every
+  // single scroll step on Coronal/Sagittal was a cold network round-trip
+  // (re-slice the volume + JPEG-encode server-side, then download), which
+  // is what made scrolling those planes feel broken/stuttery compared to
+  // axial. Combined with the backend's new plane-render cache, slices
+  // within this window are ready before the user scrolls to them.
+  const MPR_PRELOAD_WINDOW = 10;
+  useEffect(() => {
+    if (!study?.id || !mprMeta) return;
+    const planes: { plane: "coronal" | "sagittal"; max: number; current: number }[] = [];
+    if (isMprMode || activeView === "coronal") {
+      planes.push({
+        plane: "coronal",
+        max: coronalMax,
+        current: coronalSlice ?? Math.ceil(coronalMax / 2),
+      });
+    }
+    if (isMprMode || activeView === "sagittal") {
+      planes.push({
+        plane: "sagittal",
+        max: sagittalMax,
+        current: sagittalSlice ?? Math.ceil(sagittalMax / 2),
+      });
+    }
+    for (const { plane, max, current } of planes) {
+      for (let d = -MPR_PRELOAD_WINDOW; d <= MPR_PRELOAD_WINDOW; d++) {
+        if (d === 0) continue;
+        const idx = current + d;
+        if (idx < 1 || idx > max) continue;
+        const img = new Image();
+        img.src = `/api/v1/studies/${study.id}/mpr/${plane}?${plane === "coronal" ? "y" : "x"}=${
+          idx - 1
+        }&series=${primarySeriesIndex}`;
+      }
+    }
+  }, [
+    study?.id,
+    mprMeta,
+    isMprMode,
+    activeView,
+    coronalSlice,
+    sagittalSlice,
+    coronalMax,
+    sagittalMax,
+    primarySeriesIndex,
+  ]);
+
   // ── Measurement state ──────────────────────────────────────────────────
   const [measurements, setMeasurements] = useState<Measurement[]>([]);
   const [pendingPoints, setPendingPoints] = useState<Point[]>([]);
@@ -232,19 +280,35 @@ export default function ViewerPage() {
 
   // Each plane now scrolls its own axis independently — axial moves Z,
   // coronal moves Y, sagittal moves X — instead of only whichever single
-  // panel used to be "active".
-  const stepAxial = (dir: number) =>
-    setCurrentSlice((s) => Math.max(1, Math.min(maxSlicesRef.current, s + dir)));
-  const stepCoronal = (dir: number) =>
-    setCoronalSlice((s) => {
-      const cur = s ?? Math.ceil(coronalMaxRef.current / 2);
-      return Math.max(1, Math.min(coronalMaxRef.current, cur + dir));
-    });
-  const stepSagittal = (dir: number) =>
-    setSagittalSlice((s) => {
-      const cur = s ?? Math.ceil(sagittalMaxRef.current / 2);
-      return Math.max(1, Math.min(sagittalMaxRef.current, cur + dir));
-    });
+  // panel used to be "active". These only close over refs + stable setState
+  // functions, so they're memoized with empty deps: stable identity across
+  // every render, not just stable behavior. That matters below — the
+  // viewport wheel/touch listeners are attached to whatever function
+  // instance these are, and without memoization a fresh instance every
+  // render meant the DOM listeners were torn down and reattached on every
+  // single render (e.g. every slice step), which is exactly the kind of
+  // thing that shows up as janky, inconsistent scrolling.
+  const stepAxial = useCallback(
+    (dir: number) =>
+      setCurrentSlice((s) => Math.max(1, Math.min(maxSlicesRef.current, s + dir))),
+    [],
+  );
+  const stepCoronal = useCallback(
+    (dir: number) =>
+      setCoronalSlice((s) => {
+        const cur = s ?? Math.ceil(coronalMaxRef.current / 2);
+        return Math.max(1, Math.min(coronalMaxRef.current, cur + dir));
+      }),
+    [],
+  );
+  const stepSagittal = useCallback(
+    (dir: number) =>
+      setSagittalSlice((s) => {
+        const cur = s ?? Math.ceil(sagittalMaxRef.current / 2);
+        return Math.max(1, Math.min(sagittalMaxRef.current, cur + dir));
+      }),
+    [],
+  );
 
   const pinchStartDistRef = useRef<number | null>(null);
   const pinchStartZoomRef = useRef(1);
@@ -363,9 +427,22 @@ export default function ViewerPage() {
   const axialWheelAccumRef = useRef(0);
   const coronalWheelAccumRef = useRef(0);
   const sagittalWheelAccumRef = useRef(0);
-  const setAxialViewportRef = makeViewportRefSetter(axialWheelAccumRef, stepAxial);
-  const setCoronalViewportRef = makeViewportRefSetter(coronalWheelAccumRef, stepCoronal);
-  const setSagittalViewportRef = makeViewportRefSetter(sagittalWheelAccumRef, stepSagittal);
+  // Memoized so the ref-callback identity only changes if stepAxial/etc.
+  // actually change (which, now that those are memoized too, is never) —
+  // otherwise React tears down and reattaches these native wheel/touch
+  // listeners on every render.
+  const setAxialViewportRef = useMemo(
+    () => makeViewportRefSetter(axialWheelAccumRef, stepAxial),
+    [stepAxial],
+  );
+  const setCoronalViewportRef = useMemo(
+    () => makeViewportRefSetter(coronalWheelAccumRef, stepCoronal),
+    [stepCoronal],
+  );
+  const setSagittalViewportRef = useMemo(
+    () => makeViewportRefSetter(sagittalWheelAccumRef, stepSagittal),
+    [stepSagittal],
+  );
 
   // ── Crosshair math: screen click → fraction within the displayed image ──
   // Inverts the same translate/scale(flip)/rotate transform used to render

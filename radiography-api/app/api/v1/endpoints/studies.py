@@ -860,14 +860,49 @@ def _plane_to_jpeg(plane: np.ndarray, quality: int) -> bytes:
     return buf.getvalue()
 
 
-async def _load_study_volume(study_id: UUID, series: int, series_count: int, svc: StudyService) -> np.ndarray:
+# ── In-memory coronal/sagittal/MIP render cache ──────────────────────────
+#
+# Each scroll step on the coronal/sagittal panes re-slices the cached
+# volume and re-encodes a fresh JPEG, even though the neighbouring slices
+# (and any slice the user scrolls back to) are re-requested constantly —
+# scrolling forward/back near the same range, the frontend's own neighbour
+# preload, or just re-opening the same series. Caching the encoded bytes
+# here (keyed by folder + series + plane + index + quality) means all of
+# that is served instantly after the first render, which is what actually
+# makes scrolling feel smooth instead of one network round-trip per slice.
+_PLANE_CACHE: "collections.OrderedDict[tuple, bytes]" = collections.OrderedDict()
+_PLANE_CACHE_MAX = 1024
+_PLANE_CACHE_LOCK = threading.Lock()
+
+
+def _cached_plane_to_jpeg(cache_key: tuple, plane: np.ndarray, quality: int) -> bytes:
+    with _PLANE_CACHE_LOCK:
+        cached = _PLANE_CACHE.get(cache_key)
+        if cached is not None:
+            _PLANE_CACHE.move_to_end(cache_key)
+            return cached
+
+    result = _plane_to_jpeg(plane, quality)
+
+    with _PLANE_CACHE_LOCK:
+        _PLANE_CACHE[cache_key] = result
+        _PLANE_CACHE.move_to_end(cache_key)
+        while len(_PLANE_CACHE) > _PLANE_CACHE_MAX:
+            _PLANE_CACHE.popitem(last=False)
+    return result
+
+
+async def _load_study_volume(
+    study_id: UUID, series: int, series_count: int, svc: StudyService
+) -> tuple[np.ndarray, str]:
     study = await svc.get(study_id)
     if not study:
         raise HTTPException(status_code=404, detail="Study not found")
     if not study.dicom_path or not os.path.isdir(study.dicom_path):
         raise HTTPException(status_code=404, detail="No DICOM files for this study")
     try:
-        return await _get_volume(study.dicom_path, series, series_count)
+        volume = await _get_volume(study.dicom_path, series, series_count)
+        return volume, study.dicom_path
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -879,7 +914,7 @@ async def get_mpr_meta(
     series_count: int = Query(default=1, ge=1),
     svc: StudyService = Depends(get_service),
 ):
-    volume = await _load_study_volume(study_id, series, series_count, svc)
+    volume, _folder = await _load_study_volume(study_id, series, series_count, svc)
     depth, height, width = volume.shape
     return {"width": width, "height": height, "depth": depth}
 
@@ -893,11 +928,14 @@ async def get_mpr_coronal(
     quality: int = Query(default=85, ge=50, le=95),
     svc: StudyService = Depends(get_service),
 ):
-    volume = await _load_study_volume(study_id, series, series_count, svc)
+    volume, folder = await _load_study_volume(study_id, series, series_count, svc)
     depth, height, width = volume.shape
     yy = max(0, min(height - 1, y))
+    cache_key = (folder, series, "coronal", yy, quality)
     loop = asyncio.get_event_loop()
-    jpeg_bytes = await loop.run_in_executor(None, _plane_to_jpeg, volume[:, yy, :], quality)
+    jpeg_bytes = await loop.run_in_executor(
+        None, _cached_plane_to_jpeg, cache_key, volume[:, yy, :], quality
+    )
     return StreamingResponse(
         io.BytesIO(jpeg_bytes),
         media_type="image/jpeg",
@@ -914,11 +952,14 @@ async def get_mpr_sagittal(
     quality: int = Query(default=85, ge=50, le=95),
     svc: StudyService = Depends(get_service),
 ):
-    volume = await _load_study_volume(study_id, series, series_count, svc)
+    volume, folder = await _load_study_volume(study_id, series, series_count, svc)
     depth, height, width = volume.shape
     xx = max(0, min(width - 1, x))
+    cache_key = (folder, series, "sagittal", xx, quality)
     loop = asyncio.get_event_loop()
-    jpeg_bytes = await loop.run_in_executor(None, _plane_to_jpeg, volume[:, :, xx], quality)
+    jpeg_bytes = await loop.run_in_executor(
+        None, _cached_plane_to_jpeg, cache_key, volume[:, :, xx], quality
+    )
     return StreamingResponse(
         io.BytesIO(jpeg_bytes),
         media_type="image/jpeg",
@@ -934,13 +975,12 @@ async def get_mpr_mip(
     quality: int = Query(default=85, ge=50, le=95),
     svc: StudyService = Depends(get_service),
 ):
-    volume = await _load_study_volume(study_id, series, series_count, svc)
+    volume, folder = await _load_study_volume(study_id, series, series_count, svc)
+    cache_key = (folder, series, "mip", 0, quality)
     loop = asyncio.get_event_loop()
-
-    def _mip() -> bytes:
-        return _plane_to_jpeg(np.max(volume, axis=1), quality)
-
-    jpeg_bytes = await loop.run_in_executor(None, _mip)
+    jpeg_bytes = await loop.run_in_executor(
+        None, _cached_plane_to_jpeg, cache_key, np.max(volume, axis=1), quality
+    )
     return StreamingResponse(
         io.BytesIO(jpeg_bytes),
         media_type="image/jpeg",
