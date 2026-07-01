@@ -181,27 +181,52 @@ export default function ViewerPage() {
     !!study?.dicom_path && activeView === "axial",
   );
 
-  // The scout/localizer's own (usually single) file, fetched separately
-  // from the primary series so its raw image can be shown as-is — it's not
-  // part of the reconstructable volume, just a plain reference image.
-  const [scoutFile, setScoutFile] = useState<string | null>(null);
+  // The scout/localizer series' own files, fetched separately from the
+  // primary series so they can be shown as-is — not part of the
+  // reconstructable volume, just plain reference images. A scout series
+  // often has more than one frame (e.g. separate AP and lateral topograms),
+  // so this keeps the whole list and lets the user step through it exactly
+  // like the other panes, instead of only ever showing the first frame.
+  const [scoutFiles, setScoutFiles] = useState<string[]>([]);
+  const [scoutSlice, setScoutSlice] = useState(1);
   useEffect(() => {
     if (scoutSeriesIndex === null || !study?.id || !study.dicom_path) {
-      setScoutFile(null);
+      setScoutFiles([]);
       return;
     }
     let cancelled = false;
     getDicomFileList(study.id, scoutSeriesIndex)
       .then((files) => {
-        if (!cancelled) setScoutFile(files[0] ?? null);
+        if (!cancelled) {
+          setScoutFiles(files);
+          setScoutSlice(1);
+        }
       })
       .catch(() => {
-        if (!cancelled) setScoutFile(null);
+        if (!cancelled) setScoutFiles([]);
       });
     return () => {
       cancelled = true;
     };
   }, [study?.id, study?.dicom_path, scoutSeriesIndex]);
+  // Scout series are short (a handful of frames at most), so just preload
+  // all of them as soon as the file list resolves — instant stepping
+  // between AP/lateral topograms instead of a network round-trip per click.
+  useEffect(() => {
+    if (!study?.id || scoutFiles.length === 0) return;
+    for (const f of scoutFiles) {
+      const img = new Image();
+      img.src = `/api/v1/studies/${study.id}/dicom/${encodeURIComponent(f)}/preview`;
+    }
+  }, [study?.id, scoutFiles]);
+  const scoutMax = scoutFiles.length || 1;
+  const scoutMaxRef = useRef(scoutMax);
+  scoutMaxRef.current = scoutMax;
+  const stepScout = useCallback(
+    (dir: number) =>
+      setScoutSlice((s) => Math.max(1, Math.min(scoutMaxRef.current, s + dir))),
+    [],
+  );
 
   // Neighbour prefetch for the reconstructed planes — mirrors the axial
   // pane's own ±5-neighbour preload in DicomViewer.tsx. Without this, every
@@ -443,6 +468,11 @@ export default function ViewerPage() {
     () => makeViewportRefSetter(sagittalWheelAccumRef, stepSagittal),
     [stepSagittal],
   );
+  const scoutWheelAccumRef = useRef(0);
+  const setScoutViewportRef = useMemo(
+    () => makeViewportRefSetter(scoutWheelAccumRef, stepScout),
+    [stepScout],
+  );
 
   // ── Crosshair math: screen click → fraction within the displayed image ──
   // Inverts the same translate/scale(flip)/rotate transform used to render
@@ -522,7 +552,7 @@ export default function ViewerPage() {
           : activeView === "sagittal"
             ? stepSagittal
             : activeView === "scout"
-              ? () => {}
+              ? stepScout
               : stepAxial;
       if (e.key === "ArrowUp" || e.key === "ArrowRight") {
         step(1);
@@ -634,7 +664,7 @@ export default function ViewerPage() {
       : activeView === "sagittal"
         ? sagittalMax
         : activeView === "scout"
-          ? 1
+          ? scoutMax
           : maxSlices;
   const activeCurrentSlice =
     activeView === "coronal"
@@ -642,13 +672,13 @@ export default function ViewerPage() {
       : activeView === "sagittal"
         ? (sagittalSlice ?? Math.ceil(sagittalMax / 2))
         : activeView === "scout"
-          ? 1
+          ? scoutSlice
           : currentSlice;
   const setActiveCurrentSlice = (v: number) => {
     if (activeView === "coronal") setCoronalSlice(Math.max(1, Math.min(coronalMax, v)));
     else if (activeView === "sagittal") setSagittalSlice(Math.max(1, Math.min(sagittalMax, v)));
     else if (activeView === "axial") setCurrentSlice(Math.max(1, Math.min(maxSlices, v)));
-    // scout: single static image, nothing to step
+    else if (activeView === "scout") setScoutSlice(Math.max(1, Math.min(scoutMax, v)));
   };
 
   const TOOLS_PER_PAGE = isMobile ? 8 : TOOLS.length;
@@ -1380,11 +1410,13 @@ export default function ViewerPage() {
   };
 
   // ── Scout panel ──────────────────────────────────────────────────────────
-  // The scout/localizer is a single reference image, not part of the
-  // reconstructable volume — so this just shows it as-is (a plain <img>,
-  // no MPR math), both as the 4th MPR-grid quadrant and as its own
-  // standalone tab. Pan/zoom follow the shared transform state; there's no
-  // "slice" to scroll through.
+  // The scout/localizer series is shown as-is (a plain <img>, no MPR math) —
+  // it's not part of the reconstructable volume. A scout series can have
+  // more than one frame (e.g. separate AP and lateral topograms), so this
+  // steps through scoutFiles by index exactly like the axial pane steps
+  // through its own files: wheel/touch-drag with the Scroll tool, the
+  // bottom prev/next buttons, and the slice scrubber all work here too.
+  const scoutFile = scoutFiles[scoutSlice - 1] ?? scoutFiles[0] ?? null;
   const scoutSrc = scoutFile
     ? `/api/v1/studies/${study.id}/dicom/${encodeURIComponent(scoutFile)}/preview`
     : null;
@@ -1397,7 +1429,7 @@ export default function ViewerPage() {
       if (isPan) {
         setIsDragging(true);
         setDragStart({ x: e.clientX - offset.x, y: e.clientY - offset.y });
-      } else if (activeTool === "wl" || activeTool === "zoom") {
+      } else if (activeTool === "wl" || activeTool === "scroll" || activeTool === "zoom") {
         setIsDragging(true);
         setDragStart({ x: e.clientX, y: e.clientY });
       }
@@ -1413,6 +1445,12 @@ export default function ViewerPage() {
           setBrightness((b) => Math.max(0.1, Math.min(2.5, b - dy * 0.005)));
           setDragStart({ x: e.clientX, y: e.clientY });
         }
+      } else if (activeTool === "scroll") {
+        const dy = e.clientY - dragStart.y;
+        if (Math.abs(dy) > 8) {
+          stepScout(dy > 0 ? 1 : -1);
+          setDragStart({ x: e.clientX, y: e.clientY });
+        }
       } else if (activeTool === "zoom") {
         const dy = e.clientY - dragStart.y;
         if (Math.abs(dy) > 1) {
@@ -1426,10 +1464,12 @@ export default function ViewerPage() {
 
     return (
       <div
+        ref={standalone ? setScoutViewportRef : undefined}
         style={{
           width: "100%",
           height: "100%",
           position: "relative",
+          touchAction: standalone ? "none" : undefined,
           cursor: !standalone ? "default" : isPan ? (isDragging ? "grabbing" : "grab") : "default",
         }}
         onMouseDown={handleMouseDown}
@@ -1484,7 +1524,7 @@ export default function ViewerPage() {
             zIndex: 5,
           }}
         >
-          Scout
+          Scout{scoutMax > 1 ? ` · ${scoutSlice}/${scoutMax}` : ""}
         </div>
       </div>
     );
@@ -2117,7 +2157,13 @@ export default function ViewerPage() {
           </div>
           {viewTabs.map((t) => {
             const count =
-              t.id === "axial" ? maxSlices : t.id === "coronal" ? coronalMax : t.id === "sagittal" ? sagittalMax : 1;
+              t.id === "axial"
+                ? maxSlices
+                : t.id === "coronal"
+                  ? coronalMax
+                  : t.id === "sagittal"
+                    ? sagittalMax
+                    : scoutMax;
             return (
               <button
                 key={t.id}
