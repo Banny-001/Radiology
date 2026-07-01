@@ -994,7 +994,14 @@ export default function ViewerPage() {
       const aspect = plane === "coronal" ? mprMeta.width / mprMeta.depth : mprMeta.height / mprMeta.depth;
       const frac = imagePointFraction(e, aspect);
       if (!frac) return;
-      const z = Math.max(1, Math.min(maxSlicesRef.current, Math.round(frac.fy * (mprMeta.depth - 1)) + 1));
+      // Map the click's fraction down the pane directly onto the axial
+      // slice range (maxSlicesRef), not mprMeta.depth — the MPR volume can
+      // have fewer Z-rows than the real axial slice count (the backend
+      // evenly subsamples very long acquisitions for build speed), so
+      // using depth here would map a click to the wrong axial slice
+      // whenever the two counts differ. frac.fy is already a 0-1 position
+      // within the pane regardless of how many rows the image actually has.
+      const z = Math.max(1, Math.min(maxSlicesRef.current, Math.round(frac.fy * (maxSlicesRef.current - 1)) + 1));
       if (plane === "coronal") {
         setSagittalSlice(Math.round(frac.fx * (mprMeta.width - 1)) + 1);
       } else {
@@ -1357,7 +1364,14 @@ export default function ViewerPage() {
           {series.map((s, i) => (
             <button
               key={i}
+              disabled={isMprMode && i !== activeSeries}
+              title={
+                isMprMode && i !== activeSeries
+                  ? "MPR reconstructs the study's primary series — switch series after turning MPR off"
+                  : undefined
+              }
               onClick={() => {
+                if (isMprMode && i !== activeSeries) return;
                 setActiveSeries(i);
                 setCurrentSlice(1);
                 setCoronalSlice(null);
@@ -1369,7 +1383,8 @@ export default function ViewerPage() {
                 background: "#111",
                 border: `2px solid ${i === activeSeries ? "#1A73E8" : "#2a2a2a"}`,
                 borderRadius: "8px",
-                cursor: "pointer",
+                cursor: isMprMode && i !== activeSeries ? "not-allowed" : "pointer",
+                opacity: isMprMode && i !== activeSeries ? 0.4 : 1,
                 padding: "4px",
                 display: "flex",
                 flexDirection: "column",
@@ -1873,7 +1888,14 @@ export default function ViewerPage() {
           {series.map((s, i) => (
             <button
               key={i}
+              disabled={isMprMode && i !== activeSeries}
+              title={
+                isMprMode && i !== activeSeries
+                  ? "MPR reconstructs the study's primary series — switch series after turning MPR off"
+                  : undefined
+              }
               onClick={() => {
+                if (isMprMode && i !== activeSeries) return;
                 setActiveSeries(i);
                 setCurrentSlice(1);
                 setCoronalSlice(null);
@@ -1883,7 +1905,8 @@ export default function ViewerPage() {
                 background: i === activeSeries ? "rgba(26,115,232,0.15)" : "transparent",
                 border: "none",
                 borderLeft: `3px solid ${i === activeSeries ? "#1A73E8" : "transparent"}`,
-                cursor: "pointer",
+                cursor: isMprMode && i !== activeSeries ? "not-allowed" : "pointer",
+                opacity: isMprMode && i !== activeSeries ? 0.4 : 1,
                 padding: "8px",
                 display: "flex",
                 flexDirection: "column",

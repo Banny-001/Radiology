@@ -465,8 +465,17 @@ def _sorted_dicom_files(folder: str) -> list[str]:
 # resulting pixel values (e.g. the windowing fix below) — included in the
 # cache key so a stale on-disk/in-memory volume built under the old logic
 # never gets served just because the DICOM folder itself hasn't changed.
-_VOLUME_CACHE_VERSION = 4
+_VOLUME_CACHE_VERSION = 5
 _VOLUME_MAX_DIM = 384  # bumped from 320 for sharper coronal/sagittal/MIP detail
+# Now that MPR uses the whole primary series (previously it was an
+# arbitrary ~1/4 chunk of the folder), a single series can be 500-1000+
+# slices. Reading+decoding+resizing every one of those on a cold cache is
+# what made the first MPR open feel "stuck" (MIP/coronal/sagittal not
+# appearing) after the series-grouping fix. Evenly subsampling down to this
+# many slices keeps build time/memory bounded without visibly hurting
+# reconstruction quality — full anatomical coverage, just slightly coarser
+# Z-spacing on very long acquisitions.
+_VOLUME_MAX_DEPTH = 350
 # Reading+decoding hundreds of DICOM files is I/O-bound (disk reads, and
 # native decompression that releases the GIL), so this can usefully exceed
 # the droplet's 2 vCPUs — it's overlapping waits, not fighting for cores.
@@ -529,6 +538,25 @@ def _primary_series_files(folder: str) -> list[str]:
     primary_files = groups[primary_uid]
     primary_files.sort(key=lambda f: order[f])
     return primary_files
+
+
+def _subsample_depth(files: list[str], max_depth: int) -> list[str]:
+    """Evenly thins a file list down to at most max_depth entries, keeping
+    the first and last. Only used for the MPR *volume* build — the axial
+    /files endpoint always returns every real slice; this only trims how
+    many of them get stacked into the coronal/sagittal/MIP reconstruction,
+    to keep that build fast regardless of how long the acquisition is."""
+    if len(files) <= max_depth:
+        return files
+    step = len(files) / max_depth
+    seen: set[int] = set()
+    out: list[str] = []
+    for i in range(max_depth):
+        idx = min(len(files) - 1, round(i * step))
+        if idx not in seen:
+            seen.add(idx)
+            out.append(files[idx])
+    return out
 
 
 def _read_and_window_slice(path: str, lo: float, hi: float, denom: float) -> np.ndarray | None:
@@ -692,6 +720,7 @@ async def _get_volume(folder: str, series: int, series_count: int) -> np.ndarray
         files = await loop.run_in_executor(None, _primary_series_files, folder)
         if not files:
             raise ValueError("No slices available for this series")
+        files = _subsample_depth(files, _VOLUME_MAX_DEPTH)
         volume = await loop.run_in_executor(None, _build_volume, folder, files)
         _VOLUME_CACHE[key] = (dir_mtime, volume)
         await loop.run_in_executor(None, _save_volume_to_disk, folder, dir_mtime, volume)
