@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import tempfile
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from uuid import UUID, uuid4
 
@@ -407,6 +408,218 @@ def _sorted_dicom_files(folder: str) -> list[str]:
     names.sort(key=lambda f: _dicom_sort_key(os.path.join(folder, f)))
     _FILE_ORDER_CACHE[folder] = (dir_mtime, names)
     return names
+
+
+# ── Server-side MPR volume reconstruction ───────────────────────────────
+#
+# The original MPR implementation built the volume in the browser: download
+# every JPEG preview in the series, decode each one onto a canvas, stack the
+# pixels. For a several-hundred-slice series that's several hundred HTTP
+# round trips plus that many canvas decodes — which is what made the
+# coronal/sagittal/3D panes take so long to appear and forced a visible
+# "Reconstructing… NN%" progress UI.
+#
+# Building the volume here instead means one read pass over the raw DICOM
+# pixel data (no JPEG encode/decode round trip at all) done once per series,
+# cached in memory, after which every coronal/sagittal/MIP request is just a
+# numpy slice + single JPEG encode — a few milliseconds.
+
+_VOLUME_MAX_DIM = 320  # same cap the old client-side reconstruction used
+_VOLUME_BUILD_WORKERS = 4
+_VOLUME_CACHE: dict[str, tuple[float, np.ndarray]] = {}  # key -> (mtime, (depth,height,width) uint8)
+_VOLUME_LOCKS: dict[str, asyncio.Lock] = {}
+_VOLUME_LOCKS_GUARD = asyncio.Lock()
+
+
+def _partition_files(files: list[str], series: int, series_count: int) -> list[str]:
+    """Mirrors the frontend's partitionBySeries() so a given (series,
+    series_count) pair always refers to the same slice range on both sides."""
+    if not files or series_count <= 1:
+        return files
+    chunk = max(1, len(files) // series_count)
+    start = series * chunk
+    end = len(files) if series == series_count - 1 else start + chunk
+    return files[start:end]
+
+
+def _read_and_window_slice(path: str, lo: float, hi: float, denom: float) -> np.ndarray | None:
+    try:
+        ds = dcmread(path)
+        pix = ds.pixel_array.astype(np.float32)
+        if pix.ndim == 3 and pix.shape[0] not in (3, 4):
+            pix = pix[0]
+        slope = float(getattr(ds, "RescaleSlope", 1) or 1)
+        intercept = float(getattr(ds, "RescaleIntercept", 0) or 0)
+        pix = pix * slope + intercept
+        pix = np.clip(pix, lo, hi)
+        return ((pix - lo) / denom * 255).astype(np.uint8)
+    except Exception:
+        return None
+
+
+def _resize_gray(arr: np.ndarray, width: int, height: int) -> np.ndarray:
+    if arr.shape[1] == width and arr.shape[0] == height:
+        return arr
+    img = Image.fromarray(arr, mode="L")
+    return np.array(img.resize((width, height), Image.BILINEAR))
+
+
+def _build_volume(folder: str, files: list[str]) -> np.ndarray:
+    """Reads every slice's raw pixel data directly (threaded — I/O + native
+    decompression release the GIL, so this isn't fully serial even under
+    Python), applies the same series-consistent window used for the 2D
+    previews, downsamples in-plane, and stacks into one (depth, height,
+    width) uint8 volume."""
+    wc, ww = _folder_auto_window(folder)
+    lo = wc - ww / 2.0
+    hi = wc + ww / 2.0
+    denom = max(hi - lo, 1e-6)
+    paths = [os.path.join(folder, f) for f in files]
+
+    with ThreadPoolExecutor(max_workers=_VOLUME_BUILD_WORKERS) as pool:
+        raw = list(pool.map(lambda p: _read_and_window_slice(p, lo, hi, denom), paths))
+
+    decoded = [r for r in raw if r is not None]
+    if not decoded:
+        raise ValueError("No slices could be decoded for this series")
+
+    h0, w0 = decoded[0].shape[:2]
+    scale = min(1.0, _VOLUME_MAX_DIM / max(h0, w0))
+    width = max(1, round(w0 * scale))
+    height = max(1, round(h0 * scale))
+
+    resized = [_resize_gray(s, width, height) for s in decoded]
+    return np.stack(resized, axis=0)  # (depth, height, width)
+
+
+async def _get_volume(folder: str, series: int, series_count: int) -> np.ndarray:
+    """Cached per (folder, series, series_count), invalidated on folder
+    mtime change. A per-key asyncio.Lock ensures that when MPR mode turns on
+    and meta/coronal/sagittal/mip are all requested at once on a cold cache,
+    only one of them actually builds the volume — the rest just wait on the
+    same build instead of each redoing it."""
+    key = f"{folder}|{series}|{series_count}"
+    try:
+        dir_mtime = os.path.getmtime(folder)
+    except OSError:
+        dir_mtime = 0.0
+
+    cached = _VOLUME_CACHE.get(key)
+    if cached and cached[0] == dir_mtime:
+        return cached[1]
+
+    async with _VOLUME_LOCKS_GUARD:
+        lock = _VOLUME_LOCKS.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _VOLUME_LOCKS[key] = lock
+
+    async with lock:
+        cached = _VOLUME_CACHE.get(key)
+        if cached and cached[0] == dir_mtime:
+            return cached[1]
+        files = _partition_files(_sorted_dicom_files(folder), series, series_count)
+        if not files:
+            raise ValueError("No slices available for this series")
+        loop = asyncio.get_event_loop()
+        volume = await loop.run_in_executor(None, _build_volume, folder, files)
+        _VOLUME_CACHE[key] = (dir_mtime, volume)
+        return volume
+
+
+def _plane_to_jpeg(plane: np.ndarray, quality: int) -> bytes:
+    img = Image.fromarray(np.ascontiguousarray(plane), mode="L")
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    return buf.getvalue()
+
+
+async def _load_study_volume(study_id: UUID, series: int, series_count: int, svc: StudyService) -> np.ndarray:
+    study = await svc.get(study_id)
+    if not study:
+        raise HTTPException(status_code=404, detail="Study not found")
+    if not study.dicom_path or not os.path.isdir(study.dicom_path):
+        raise HTTPException(status_code=404, detail="No DICOM files for this study")
+    try:
+        return await _get_volume(study.dicom_path, series, series_count)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.get("/{study_id}/mpr/meta")
+async def get_mpr_meta(
+    study_id: UUID,
+    series: int = Query(default=0, ge=0),
+    series_count: int = Query(default=1, ge=1),
+    svc: StudyService = Depends(get_service),
+):
+    volume = await _load_study_volume(study_id, series, series_count, svc)
+    depth, height, width = volume.shape
+    return {"width": width, "height": height, "depth": depth}
+
+
+@router.get("/{study_id}/mpr/coronal")
+async def get_mpr_coronal(
+    study_id: UUID,
+    y: int = Query(default=0, ge=0),
+    series: int = Query(default=0, ge=0),
+    series_count: int = Query(default=1, ge=1),
+    quality: int = Query(default=85, ge=50, le=95),
+    svc: StudyService = Depends(get_service),
+):
+    volume = await _load_study_volume(study_id, series, series_count, svc)
+    depth, height, width = volume.shape
+    yy = max(0, min(height - 1, y))
+    loop = asyncio.get_event_loop()
+    jpeg_bytes = await loop.run_in_executor(None, _plane_to_jpeg, volume[:, yy, :], quality)
+    return StreamingResponse(
+        io.BytesIO(jpeg_bytes),
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=3600", "Content-Length": str(len(jpeg_bytes))},
+    )
+
+
+@router.get("/{study_id}/mpr/sagittal")
+async def get_mpr_sagittal(
+    study_id: UUID,
+    x: int = Query(default=0, ge=0),
+    series: int = Query(default=0, ge=0),
+    series_count: int = Query(default=1, ge=1),
+    quality: int = Query(default=85, ge=50, le=95),
+    svc: StudyService = Depends(get_service),
+):
+    volume = await _load_study_volume(study_id, series, series_count, svc)
+    depth, height, width = volume.shape
+    xx = max(0, min(width - 1, x))
+    loop = asyncio.get_event_loop()
+    jpeg_bytes = await loop.run_in_executor(None, _plane_to_jpeg, volume[:, :, xx], quality)
+    return StreamingResponse(
+        io.BytesIO(jpeg_bytes),
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=3600", "Content-Length": str(len(jpeg_bytes))},
+    )
+
+
+@router.get("/{study_id}/mpr/mip")
+async def get_mpr_mip(
+    study_id: UUID,
+    series: int = Query(default=0, ge=0),
+    series_count: int = Query(default=1, ge=1),
+    quality: int = Query(default=85, ge=50, le=95),
+    svc: StudyService = Depends(get_service),
+):
+    volume = await _load_study_volume(study_id, series, series_count, svc)
+    loop = asyncio.get_event_loop()
+
+    def _mip() -> bytes:
+        return _plane_to_jpeg(np.max(volume, axis=1), quality)
+
+    jpeg_bytes = await loop.run_in_executor(None, _mip)
+    return StreamingResponse(
+        io.BytesIO(jpeg_bytes),
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=3600", "Content-Length": str(len(jpeg_bytes))},
+    )
 
 
 @router.get("/{study_id}/files")

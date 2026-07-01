@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useMemo } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useParams, useNavigate, useSearchParams } from "react-router-dom";
 import {
   ArrowLeft,
@@ -20,13 +20,8 @@ import { renderImage } from "./components/medicalImages";
 import { StudyInfoPanel } from "./components/StudyInfoPanel";
 import { DiscussionPanel } from "./components/DiscussionPanel";
 import DicomViewer from "./DicomViewer";
-import { useDicomVolume } from "./components/useDicomVolume";
-import {
-  reconstructCoronal,
-  reconstructSagittal,
-  reconstructCoronalMIP,
-} from "./components/reconstructPlane";
-import ReconstructedPlaneCanvas from "./components/ReconstructedPlaneCanvas";
+import { useMprMeta } from "./components/useMprMeta";
+import MprPlaneImage from "./components/MprPlaneImage";
 import { useLocalizerStrip } from "./components/useLocalizerStrip";
 import SliceScrubber from "./components/SliceScrubber";
 
@@ -98,28 +93,17 @@ export default function ViewerPage() {
   const seriesCountForVolume = study
     ? (SERIES_MAP[study.modality] ?? SERIES_MAP.CT).length
     : 1;
-  const {
-    volume,
-    progress: volumeProgress,
-    error: volumeError,
-  } = useDicomVolume(
+  // The volume itself is now built server-side (see studies.py /mpr/*) from
+  // raw DICOM pixel data, cached in memory per series — this hook only
+  // fetches the resulting dimensions, not hundreds of slice images.
+  const { meta: mprMeta, error: mprError } = useMprMeta(
     study?.id ?? "",
     activeSeries,
     seriesCountForVolume,
     isMprMode && !!study?.dicom_path,
   );
-  const coronalMax = volume?.height ?? 1;
-  const sagittalMax = volume?.width ?? 1;
-
-  // Coronal MIP (Maximum Intensity Projection) for the 4th quadrant — a real
-  // 3D-derived rendering using the whole volume at once (classic "see
-  // through" bone/vessel look), and much lighter than full GPU raycasting.
-  // Recomputed only when the volume itself changes, not on every slice
-  // scroll, since it's an O(width*height*depth) scan.
-  const mipImage = useMemo(
-    () => (volume ? reconstructCoronalMIP(volume) : null),
-    [volume],
-  );
+  const coronalMax = mprMeta?.height ?? 1;
+  const sagittalMax = mprMeta?.width ?? 1;
 
   // Cheap, always-on position indicator for the slice scrubber — sampled
   // from a bounded number of slices, so unlike the full MPR volume this
@@ -653,7 +637,7 @@ export default function ViewerPage() {
 
   // ── Crosshair overlay: shows where the OTHER two planes are cutting ─────
   const renderCrosshair = (kind: "axial" | "coronal" | "sagittal") => {
-    if (!isMprMode || !volume) return null;
+    if (!isMprMode || !mprMeta) return null;
     const sagFrac =
       sagittalMax > 1 ? ((sagittalSlice ?? Math.ceil(sagittalMax / 2)) - 1) / (sagittalMax - 1) : 0.5;
     const corFrac =
@@ -723,11 +707,11 @@ export default function ViewerPage() {
     };
 
     const updateCrosshairFromEvent = (e: React.MouseEvent) => {
-      if (!volume) return;
-      const frac = imagePointFraction(e, volume.width / volume.height);
+      if (!mprMeta) return;
+      const frac = imagePointFraction(e, mprMeta.width / mprMeta.height);
       if (!frac) return;
-      setSagittalSlice(Math.round(frac.fx * (volume.width - 1)) + 1);
-      setCoronalSlice(Math.round(frac.fy * (volume.height - 1)) + 1);
+      setSagittalSlice(Math.round(frac.fx * (mprMeta.width - 1)) + 1);
+      setCoronalSlice(Math.round(frac.fy * (mprMeta.height - 1)) + 1);
     };
 
     const handleViewportClick = (e: React.MouseEvent) => {
@@ -925,21 +909,21 @@ export default function ViewerPage() {
   };
 
   // ── Reconstructed coronal/sagittal panel ────────────────────────────────
-  // Resamples the volume built by useDicomVolume along the coronal/sagittal
-  // axis, so each pane shows a genuinely different orthogonal cut of the
-  // same anatomy — and, like the axial pane, clicking/dragging with the
-  // default "pan" tool repositions the shared crosshair, live-updating the
-  // other two panes.
+  // The cut itself is now built server-side (see /mpr/coronal, /mpr/sagittal
+  // in studies.py) from the cached volume — this just points an <img> at the
+  // right URL for the current slice, same as the axial pane. Like the axial
+  // pane, clicking/dragging with the default "pan" tool repositions the
+  // shared crosshair, live-updating the other two panes.
   const renderPlanePanel = (plane: "coronal" | "sagittal", label: string) => {
     const sliceMax = plane === "coronal" ? coronalMax : sagittalMax;
     const sliceValue =
       (plane === "coronal" ? coronalSlice : sagittalSlice) ??
       Math.ceil(sliceMax / 2);
 
-    const planeImage = volume
-      ? plane === "coronal"
-        ? reconstructCoronal(volume, sliceValue - 1)
-        : reconstructSagittal(volume, sliceValue - 1)
+    const planeSrc = mprMeta
+      ? `/api/v1/studies/${study.id}/mpr/${plane}?${plane === "coronal" ? "y" : "x"}=${
+          sliceValue - 1
+        }&series=${activeSeries}&series_count=${series.length}`
       : null;
 
     const isCrosshair = activeTool === "pan";
@@ -963,15 +947,15 @@ export default function ViewerPage() {
     };
 
     const updateCrosshairFromEvent = (e: React.MouseEvent) => {
-      if (!volume) return;
-      const aspect = plane === "coronal" ? volume.width / volume.depth : volume.height / volume.depth;
+      if (!mprMeta) return;
+      const aspect = plane === "coronal" ? mprMeta.width / mprMeta.depth : mprMeta.height / mprMeta.depth;
       const frac = imagePointFraction(e, aspect);
       if (!frac) return;
-      const z = Math.max(1, Math.min(maxSlicesRef.current, Math.round(frac.fy * (volume.depth - 1)) + 1));
+      const z = Math.max(1, Math.min(maxSlicesRef.current, Math.round(frac.fy * (mprMeta.depth - 1)) + 1));
       if (plane === "coronal") {
-        setSagittalSlice(Math.round(frac.fx * (volume.width - 1)) + 1);
+        setSagittalSlice(Math.round(frac.fx * (mprMeta.width - 1)) + 1);
       } else {
-        setCoronalSlice(Math.round(frac.fx * (volume.height - 1)) + 1);
+        setCoronalSlice(Math.round(frac.fx * (mprMeta.height - 1)) + 1);
       }
       setCurrentSlice(z);
     };
@@ -1072,18 +1056,20 @@ export default function ViewerPage() {
         onMouseUp={handleMouseUp}
         onMouseLeave={handleMouseUp}
       >
-        <ReconstructedPlaneCanvas
-          plane={planeImage}
-          brightness={brightness}
-          isInverted={isInverted}
-          zoom={zoom}
-          rotation={rotation}
-          flipH={flipH}
-          flipV={flipV}
-          offsetX={offset.x}
-          offsetY={offset.y}
-        />
-        {!volume && (
+        {planeSrc && (
+          <MprPlaneImage
+            src={planeSrc}
+            brightness={brightness}
+            isInverted={isInverted}
+            zoom={zoom}
+            rotation={rotation}
+            flipH={flipH}
+            flipV={flipV}
+            offsetX={offset.x}
+            offsetY={offset.y}
+          />
+        )}
+        {mprError && (
           <div
             style={{
               position: "absolute",
@@ -1091,23 +1077,14 @@ export default function ViewerPage() {
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
-              flexDirection: "column",
-              gap: 6,
-              color: volumeError ? "#ef4444" : "#6b7280",
+              color: "#ef4444",
               fontSize: 10,
               fontFamily: "monospace",
               textAlign: "center",
               padding: 12,
             }}
           >
-            {volumeError ? (
-              <span>{volumeError}</span>
-            ) : (
-              <>
-                <span>Reconstructing {label.toLowerCase()}…</span>
-                <span>{volumeProgress}%</span>
-              </>
-            )}
+            {mprError}
           </div>
         )}
         {renderCrosshair(plane)}
@@ -1136,60 +1113,67 @@ export default function ViewerPage() {
   // ── 4th quadrant: MIP (a real 3D-derived render, not a placeholder) ─────
   // Full rotatable GPU volume rendering + freeform oblique planes remain a
   // bigger follow-up, but a Maximum Intensity Projection is a real,
-  // standard "3D" radiology view computed from the same volume already in
-  // memory — no reason to leave this quadrant fake in the meantime.
-  const render3dPanel = () => (
-    <div style={{ width: "100%", height: "100%", position: "relative" }}>
-      <ReconstructedPlaneCanvas
-        plane={mipImage}
-        brightness={brightness}
-        isInverted={isInverted}
-        zoom={1}
-        rotation={0}
-        flipH={false}
-        flipV={false}
-        offsetX={0}
-        offsetY={0}
-      />
-      {!mipImage && (
+  // standard "3D" radiology view computed server-side from the same cached
+  // volume the coronal/sagittal panes use — no reason to leave this
+  // quadrant fake in the meantime.
+  const render3dPanel = () => {
+    const mipSrc = mprMeta
+      ? `/api/v1/studies/${study.id}/mpr/mip?series=${activeSeries}&series_count=${series.length}`
+      : null;
+
+    return (
+      <div style={{ width: "100%", height: "100%", position: "relative" }}>
+        {mipSrc && (
+          <MprPlaneImage
+            src={mipSrc}
+            brightness={brightness}
+            isInverted={isInverted}
+            zoom={1}
+            rotation={0}
+            flipH={false}
+            flipV={false}
+            offsetX={0}
+            offsetY={0}
+          />
+        )}
+        {mprError && (
+          <div
+            style={{
+              position: "absolute",
+              inset: 0,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              color: "#ef4444",
+              fontSize: 10,
+              fontFamily: "monospace",
+              textAlign: "center",
+              padding: 12,
+            }}
+          >
+            {mprError}
+          </div>
+        )}
         <div
           style={{
             position: "absolute",
-            inset: 0,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            flexDirection: "column",
-            gap: 6,
-            color: volumeError ? "#ef4444" : "#6b7280",
-            fontSize: 10,
+            top: 6,
+            left: 6,
+            fontSize: "10px",
             fontFamily: "monospace",
-            textAlign: "center",
-            padding: 12,
+            color: "#93c5fd",
+            background: "rgba(0,0,0,0.55)",
+            padding: "2px 6px",
+            borderRadius: "4px",
+            pointerEvents: "none",
+            zIndex: 5,
           }}
         >
-          {volumeError ? <span>{volumeError}</span> : <span>Building projection…</span>}
+          3D · MIP projection
         </div>
-      )}
-      <div
-        style={{
-          position: "absolute",
-          top: 6,
-          left: 6,
-          fontSize: "10px",
-          fontFamily: "monospace",
-          color: "#93c5fd",
-          background: "rgba(0,0,0,0.55)",
-          padding: "2px 6px",
-          borderRadius: "4px",
-          pointerEvents: "none",
-          zIndex: 5,
-        }}
-      >
-        3D · MIP projection
       </div>
-    </div>
-  );
+    );
+  };
 
   // ── Viewport: single panel OR 2×2 real, crosshair-linked MPR quad ───────
   const renderViewport = (w: string, h: string) => {
