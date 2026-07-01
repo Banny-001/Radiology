@@ -357,32 +357,55 @@ def _natural_key(name: str) -> list:
     return [int(tok) if tok.isdigit() else tok.lower() for tok in _NATURAL_SPLIT_RE.split(name)]
 
 
-def _dicom_sort_key(path: str) -> tuple:
-    """Real acquisition order, not filename order.
+# Modalities that are never a viewable cross-sectional slice — structured
+# reports, presentation states, key-object selections, etc.
+_NON_IMAGE_MODALITIES = {"SR", "PR", "KO", "DOC"}
 
-    Plain lexicographic sort() on filenames scrambles unpadded numeric names
-    (IM1, IM10, IM100, ..., IM2, IM20, ...) into something that isn't the
-    true slice sequence. That's fine for viewing one axial slice at a time,
-    but it corrupts anything that stacks slices along Z — which is exactly
-    what the coronal/sagittal MPR reconstruction does, producing the
-    banded/interlaced look. Sort on DICOM InstanceNumber first (what the
-    scanner actually assigned), falling back to slice position, then to a
-    natural filename sort as a last resort for non-conformant files.
+
+def _dicom_file_info(path: str) -> tuple[bool, tuple]:
+    """Reads a file's header once and returns (keep_as_slice, sort_key).
+
+    Some scanners (GE in particular) drop a "dose report" page — a text
+    table rendered as a Secondary Capture image — into the same folder as
+    the real slices. Left in, it shows up as a nonsense "slice" partway
+    through the stack, and because the per-series auto-window and MPR
+    volume pool pixel values across every file in the folder, that one
+    non-anatomical page (arbitrary pixel range, no real HU data) skews the
+    shared contrast window and can corrupt the coronal/sagittal
+    reconstruction for the *whole* series. Real cross-sectional slices
+    always carry patient-space geometry (ImagePositionPatient +
+    PixelSpacing); dose reports and other secondary-capture pages don't —
+    that's a more reliable signal than Modality alone, which manufacturers
+    are inconsistent about.
+
+    Sort order itself is unchanged: InstanceNumber first (what the scanner
+    actually assigned), falling back to slice position, then a natural
+    filename sort for non-conformant files — plain lexicographic sort()
+    scrambles unpadded numeric names (IM1, IM10, IM100, ..., IM2, IM20, ...),
+    which is exactly what corrupts anything that stacks slices along Z.
     """
     try:
         ds = dcmread(path, stop_before_pixels=True, force=True)
-        instance_number = getattr(ds, "InstanceNumber", None)
-        if instance_number is not None:
-            return (0, int(instance_number))
-        slice_location = getattr(ds, "SliceLocation", None)
-        if slice_location is not None:
-            return (1, float(slice_location))
-        position = getattr(ds, "ImagePositionPatient", None)
-        if position is not None and len(position) == 3:
-            return (1, float(position[2]))
     except Exception:
-        pass
-    return (2, _natural_key(os.path.basename(path)))
+        return True, (2, _natural_key(os.path.basename(path)))
+
+    modality = str(getattr(ds, "Modality", "") or "").upper()
+    has_geometry = (
+        getattr(ds, "ImagePositionPatient", None) is not None
+        and getattr(ds, "PixelSpacing", None) is not None
+    )
+    keep = modality not in _NON_IMAGE_MODALITIES and has_geometry
+
+    instance_number = getattr(ds, "InstanceNumber", None)
+    if instance_number is not None:
+        return keep, (0, int(instance_number))
+    slice_location = getattr(ds, "SliceLocation", None)
+    if slice_location is not None:
+        return keep, (1, float(slice_location))
+    position = getattr(ds, "ImagePositionPatient", None)
+    if position is not None and len(position) == 3:
+        return keep, (1, float(position[2]))
+    return keep, (2, _natural_key(os.path.basename(path)))
 
 
 # Per-process cache of sorted order, keyed by folder and auto-invalidated
@@ -401,11 +424,13 @@ def _sorted_dicom_files(folder: str) -> list[str]:
     if cached and cached[0] == dir_mtime:
         return cached[1]
 
-    names = [
+    candidates = [
         f for f in os.listdir(folder)
         if os.path.isfile(os.path.join(folder, f)) and not f.startswith("__tmp_")
     ]
-    names.sort(key=lambda f: _dicom_sort_key(os.path.join(folder, f)))
+    infos = [(f, *_dicom_file_info(os.path.join(folder, f))) for f in candidates]
+    kept = sorted((key, f) for f, keep, key in infos if keep)
+    names = [f for _, f in kept]
     _FILE_ORDER_CACHE[folder] = (dir_mtime, names)
     return names
 
@@ -428,7 +453,21 @@ _VOLUME_MAX_DIM = 320  # same cap the old client-side reconstruction used
 _VOLUME_BUILD_WORKERS = 4
 _VOLUME_CACHE: dict[str, tuple[float, np.ndarray]] = {}  # key -> (mtime, (depth,height,width) uint8)
 _VOLUME_LOCKS: dict[str, asyncio.Lock] = {}
-_VOLUME_LOCKS_GUARD = asyncio.Lock()
+# NOT constructed here at import time on purpose: asyncio.Lock() binds to
+# "the current event loop" at construction in some Python/uvicorn/uvloop
+# combinations. Built at module import (before uvicorn's loop exists), it
+# can end up bound to the wrong loop and raise as soon as it's first
+# awaited — i.e. exactly on the first MPR request, crashing that worker.
+# Creating it lazily inside an async function guarantees it's built while
+# the real request-serving loop is already running.
+_VOLUME_LOCKS_GUARD: asyncio.Lock | None = None
+
+
+def _volume_locks_guard() -> asyncio.Lock:
+    global _VOLUME_LOCKS_GUARD
+    if _VOLUME_LOCKS_GUARD is None:
+        _VOLUME_LOCKS_GUARD = asyncio.Lock()
+    return _VOLUME_LOCKS_GUARD
 
 
 def _partition_files(files: list[str], series: int, series_count: int) -> list[str]:
@@ -508,7 +547,7 @@ async def _get_volume(folder: str, series: int, series_count: int) -> np.ndarray
     if cached and cached[0] == dir_mtime:
         return cached[1]
 
-    async with _VOLUME_LOCKS_GUARD:
+    async with _volume_locks_guard():
         lock = _VOLUME_LOCKS.get(key)
         if lock is None:
             lock = asyncio.Lock()
