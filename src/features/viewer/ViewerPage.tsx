@@ -91,11 +91,19 @@ export default function ViewerPage() {
   const [coronalSlice, setCoronalSlice] = useState<number | null>(null);
   const [sagittalSlice, setSagittalSlice] = useState<number | null>(null);
 
-  const seriesCountForVolume = study
-    ? (SERIES_MAP[study.modality] ?? SERIES_MAP.CT).length
-    : 1;
+  // The backend's /files endpoint now returns only the study's primary
+  // real DICOM series (see _primary_series_files in studies.py) — the
+  // exact same file set the MPR volume is built from. Previously the
+  // frontend re-chunked that list again into N arbitrary equal pieces (one
+  // per fake sidebar "series" tab), which meant the axial pane and the
+  // MPR volume could end up scrolling through *different* file subsets —
+  // that's what made a given "slice N" show a different physical position
+  // in the axial pane than in the coronal/sagittal/MIP panes. Passing
+  // seriesCount=1 everywhere disables that re-chunking so every view reads
+  // the same, already-correct list.
+  const seriesCountForVolume = 1;
   // The volume itself is now built server-side (see studies.py /mpr/*) from
-  // raw DICOM pixel data, cached in memory per series — this hook only
+  // raw DICOM pixel data, cached in memory per study — this hook only
   // fetches the resulting dimensions, not hundreds of slice images.
   const { meta: mprMeta, loading: mprLoading, error: mprError } = useMprMeta(
     study?.id ?? "",
@@ -847,9 +855,8 @@ export default function ViewerPage() {
           offsetX={offset.x}
           offsetY={offset.y}
           activeSeries={activeSeries}
-          seriesCount={series.length}
+          seriesCount={1}
           onFileCountChange={setDicomFileCount}
-          suppressBackgroundPrefetch={isMprMode}
         />
       </div>
     ) : (
@@ -1417,7 +1424,7 @@ export default function ViewerPage() {
           </div>
           {renderMissingDicomBadge()}
 
-          {!isMprMode && !!study.dicom_path && maxSlices > 1 && (
+          {!!study.dicom_path && maxSlices > 1 && (
             <SliceScrubber
               currentSlice={currentSlice}
               maxSlices={maxSlices}
@@ -1937,7 +1944,7 @@ export default function ViewerPage() {
           </div>
           {renderMissingDicomBadge()}
 
-          {!isMprMode && !!study.dicom_path && maxSlices > 1 && (
+          {!!study.dicom_path && maxSlices > 1 && (
             <SliceScrubber
               currentSlice={currentSlice}
               maxSlices={maxSlices}

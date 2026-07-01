@@ -465,8 +465,8 @@ def _sorted_dicom_files(folder: str) -> list[str]:
 # resulting pixel values (e.g. the windowing fix below) — included in the
 # cache key so a stale on-disk/in-memory volume built under the old logic
 # never gets served just because the DICOM folder itself hasn't changed.
-_VOLUME_CACHE_VERSION = 3
-_VOLUME_MAX_DIM = 320  # same cap the old client-side reconstruction used
+_VOLUME_CACHE_VERSION = 4
+_VOLUME_MAX_DIM = 384  # bumped from 320 for sharper coronal/sagittal/MIP detail
 # Reading+decoding hundreds of DICOM files is I/O-bound (disk reads, and
 # native decompression that releases the GIL), so this can usefully exceed
 # the droplet's 2 vCPUs — it's overlapping waits, not fighting for cores.
@@ -800,14 +800,27 @@ async def list_study_files(
 ):
     """Returns filenames in true acquisition order (DICOM InstanceNumber /
     SliceLocation), not filename order, so the viewer can build full WADO
-    URLs and reliably stack slices for MPR reconstruction."""
+    URLs and reliably stack slices for MPR reconstruction.
+
+    Returns only the primary series' files (see _primary_series_files) —
+    the same set MPR reconstructs from. Previously this returned every file
+    in the folder, which the frontend then re-chunked into N arbitrary
+    equal pieces to fill the sidebar's generic series tabs. Those chunk
+    boundaries didn't line up with the real series boundaries MPR now
+    respects, so scrolling the axial pane to "slice 162" and looking at the
+    coronal/sagittal/MIP panes showed a *different* physical position than
+    the axial slice on screen — the axial view and the MPR volume were
+    silently built from different file sets. Serving one consistent file
+    list to both keeps "current slice" meaning the same physical location
+    everywhere.
+    """
     study = await svc.get(study_id)
     if not study:
         raise HTTPException(status_code=404, detail="Study not found")
     if not study.dicom_path or not os.path.isdir(study.dicom_path):
         return {"files": []}
     loop = asyncio.get_event_loop()
-    files = await loop.run_in_executor(None, _sorted_dicom_files, study.dicom_path)
+    files = await loop.run_in_executor(None, _primary_series_files, study.dicom_path)
     return {"files": files}
 
 
